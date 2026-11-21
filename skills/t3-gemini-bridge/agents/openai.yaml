@@ -1,0 +1,8 @@
+interface:
+  display_name: "T3 <-> Gemini Desktop Bridge"
+  short_description: "1-to-1 automated bridge between T3 Code and Gemini Desktop"
+  brand_color: "#2563EB"
+  default_prompt: "Use $t3-gemini-bridge to check bridge health, bind a T3 thread 1-to-1 with a Gemini Desktop Task conversation, or switch routing modes."
+
+policy:
+  allow_implicit_invocation: true
