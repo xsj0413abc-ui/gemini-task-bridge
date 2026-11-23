@@ -46,6 +46,7 @@ LEDGER_WARN_BYTES = 24 * 1024 * 1024
 MAX_BASELINE_BYTES = 64 * 1024
 MAX_BASELINE_CHUNKS = 200
 IN_FLIGHT_ENVELOPE_READ_MAX_BYTES = 2 * 1024 * 1024
+ARCHIVED_PAYLOAD_READ_MAX_BYTES = 2 * 1024 * 1024 + 65536
 
 LABEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 PAIR_UID_RE = re.compile(r"^[0-9a-f]{32}$")
@@ -1226,10 +1227,7 @@ class Bridge:
         return f"sent/{task_id}.json"
 
     def _max_archived_payload_bytes(self, cfg: dict[str, Any]) -> int:
-        return min(
-            2 * 1024 * 1024 + 65536,
-            max(cfg["max_receipt_file_bytes"], cfg["max_message_bytes"] * 2 + 16384, 262144),
-        )
+        return ARCHIVED_PAYLOAD_READ_MAX_BYTES
 
     def _validate_payload_relpath(self, task_id: str, rel: Any, adapter: str | None = None) -> str:
         if not isinstance(task_id, str) or not TASK_ID_RE.fullmatch(task_id):
@@ -2271,7 +2269,12 @@ class Bridge:
                 continue
             try:
                 env = decode_json(read_bytes(path, IN_FLIGHT_ENVELOPE_READ_MAX_BYTES))
-                if isinstance(env, dict) and isinstance(env.get("pairId"), str) and isinstance(env.get("taskId"), str):
+                if (
+                    isinstance(env, dict)
+                    and isinstance(env.get("pairId"), str)
+                    and isinstance(env.get("taskId"), str)
+                    and path.name == f"{env['taskId']}.task.json"
+                ):
                     result[env["pairId"]] = env["taskId"]
             except Exception:
                 continue
@@ -2429,6 +2432,10 @@ class Bridge:
         for path in in_flight_files:
             if path.name.startswith((".", "_")) or path.is_symlink():
                 continue
+            file_tid = path.name[:-len(".task.json")] if path.name.endswith(".task.json") else None
+            if not isinstance(file_tid, str) or not TASK_ID_RE.fullmatch(file_tid):
+                self.move(path, "failed")
+                continue
             try:
                 task = decode_json(read_bytes(path, in_flight_limit))
             except Exception:
@@ -2437,10 +2444,23 @@ class Bridge:
             if not isinstance(task, dict):
                 self.move(path, "failed")
                 continue
-            tid = task.get("taskId")
-            if not isinstance(tid, str) or not TASK_ID_RE.fullmatch(tid):
+            body_tid = task.get("taskId")
+            body_pair = task.get("pairId")
+            d_check = ledger_snap["dispatches"].get(file_tid)
+            if (
+                not isinstance(body_tid, str)
+                or body_tid != file_tid
+                or not isinstance(body_pair, str)
+                or (
+                    isinstance(d_check, dict)
+                    and isinstance(d_check.get("pairId"), str)
+                    and body_pair != d_check.get("pairId")
+                )
+            ):
                 self.move(path, "failed")
+                self.log("in_flight_file_rejected", file_tid, "filename_body_or_pair_mismatch")
                 continue
+            tid = file_tid
             seen_tids.add(tid)
             t_rec = ledger_snap["tasks"].get(tid)
             # First clean up any task already marked sent in ledger

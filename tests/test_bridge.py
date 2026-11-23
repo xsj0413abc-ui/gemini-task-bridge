@@ -2353,6 +2353,97 @@ class BridgePhase1Tests(unittest.TestCase):
         self.assertEqual(st_a["reason"], "invalid_inbox_task")
         self.assertEqual(self.bridge.get_task_status("task-b")["status"], "in_flight")
 
+    def test_review4_p1_in_flight_tampered_task_id_isolates_file_and_both_pairs_complete(self) -> None:
+        with mock.patch("sys.stdout", new=io.StringIO()):
+            tb.cmd_pair(
+                self.bridge,
+                argparse.Namespace(
+                    pair_cmd="add", id="loc_a", adapter="local", t3_thread=None,
+                    gemini_title="Gem-R4A", reply_to=None, label=None, workspace=None,
+                    route="gemini", reply_mode="auto", force=False,
+                ),
+            )
+            tb.cmd_pair(
+                self.bridge,
+                argparse.Namespace(
+                    pair_cmd="add", id="loc_b", adapter="local", t3_thread=None,
+                    gemini_title="Gem-R4B", reply_to=None, label=None, workspace=None,
+                    route="gemini", reply_mode="auto", force=False,
+                ),
+            )
+        self.ax.add_conv("Gem-R4A")
+        self.ax.add_conv("Gem-R4B")
+
+        self.bridge.submit_task(pair_id="loc_a", message="Work on A", task_id="task-a")
+        self.bridge.submit_task(pair_id="loc_b", message="Work on B", task_id="task-b")
+        self.bridge.scan(recover=False)
+        self.assertEqual(self.bridge.get_task_status("task-a")["status"], "in_flight")
+        self.assertEqual(self.bridge.get_task_status("task-b")["status"], "in_flight")
+        self.assertEqual(len(self.ax.injected_prompts), 2)
+
+        # Tamper in_flight/task-a.task.json so body claims taskId="task-b" while pairId remains "loc_a"
+        loc_a_uid = self.bridge.pairs()["pairs"]["loc_a"]["pairUid"]
+        tb.atomic_json(self.root / "inbox/in_flight/task-a.task.json", {
+            "schemaVersion": 2, "taskId": "task-b", "pairId": "loc_a", "pairUid": loc_a_uid,
+            "replyThreadId": None, "replyMode": "auto", "message": "Confused taskId",
+        })
+
+        self.bridge.scan(recover=False)
+        self.assertTrue((self.root / "failed/task-a.task.json").exists())
+        self.assertFalse((self.root / "inbox/in_flight/task-a.task.json").exists())
+        # BOTH dispatches MUST remain in_flight with zero duplicate AX sends
+        self.assertEqual(self.bridge.get_task_status("task-a")["status"], "in_flight")
+        self.assertEqual(self.bridge.get_task_status("task-b")["status"], "in_flight")
+        self.assertEqual(len(self.ax.injected_prompts), 2)
+
+        # Both pairs STILL complete cleanly via their legitimate outbox receipts!
+        tb.atomic_json(self.root / "outbox/task-a.json", {"taskId": "task-a", "pairId": "loc_a", "message": "Done A"})
+        tb.atomic_json(self.root / "outbox/task-b.json", {"taskId": "task-b", "pairId": "loc_b", "message": "Done B"})
+        self.bridge.scan(recover=False)
+        self.assertEqual(self.bridge.get_task_status("task-a")["status"], "sent")
+        self.assertEqual(self.bridge.get_task_status("task-b")["status"], "sent")
+        self.assertEqual(self.bridge.read_task_payload("task-a")["message"], "Done A")
+        self.assertEqual(self.bridge.read_task_payload("task-b")["message"], "Done B")
+
+    def test_review4_p2_large_archived_reply_survives_lowering_message_and_receipt_limits(self) -> None:
+        with mock.patch("sys.stdout", new=io.StringIO()):
+            tb.cmd_pair(
+                self.bridge,
+                argparse.Namespace(
+                    pair_cmd="add", id="loc_big", adapter="local", t3_thread=None,
+                    gemini_title="Gem-R4Big", reply_to=None, label=None, workspace=None,
+                    route="gemini", reply_mode="auto", force=False,
+                ),
+            )
+        self.ax.add_conv("Gem-R4Big")
+
+        cfg = self.bridge.config()
+        cfg["max_message_bytes"] = 512 * 1024
+        cfg["max_receipt_file_bytes"] = 768 * 1024
+        self.bridge.save_config(cfg)
+
+        self.bridge.submit_task(pair_id="loc_big", message="Short prompt", task_id="big-arch-1")
+        self.bridge.scan(recover=False)
+        big_reply = "B" * (300 * 1024)
+        tb.atomic_json(self.root / "outbox/big-arch-1.json", {
+            "taskId": "big-arch-1", "pairId": "loc_big", "message": big_reply,
+        })
+        self.bridge.scan(recover=False)
+        rc1, out1 = self.bridge.wait_for_task("big-arch-1", timeout_s=1.0)
+        self.assertEqual(rc1, 0)
+        self.assertEqual(out1["message"], big_reply)
+
+        # Lower both message and receipt limits back to defaults -> archived reply MUST remain readable!
+        cfg["max_message_bytes"] = 32768
+        cfg["max_receipt_file_bytes"] = 65536
+        self.bridge.save_config(cfg)
+
+        self.assertEqual(self.bridge.read_task_payload("big-arch-1")["message"], big_reply)
+        rc2, out2 = self.bridge.wait_for_task("big-arch-1", timeout_s=1.0)
+        self.assertEqual(rc2, 0)
+        self.assertTrue(out2["ok"])
+        self.assertEqual(out2["message"], big_reply)
+
 
 if __name__ == "__main__":
     unittest.main()
