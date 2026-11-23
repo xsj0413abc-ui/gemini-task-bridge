@@ -45,6 +45,7 @@ LEDGER_INTAKE_MAX_BYTES = 28 * 1024 * 1024
 LEDGER_WARN_BYTES = 24 * 1024 * 1024
 MAX_BASELINE_BYTES = 64 * 1024
 MAX_BASELINE_CHUNKS = 200
+IN_FLIGHT_ENVELOPE_READ_MAX_BYTES = 2 * 1024 * 1024
 
 LABEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 PAIR_UID_RE = re.compile(r"^[0-9a-f]{32}$")
@@ -1224,6 +1225,25 @@ class Bridge:
             return f"sent/payloads/{task_id}.json"
         return f"sent/{task_id}.json"
 
+    def _max_archived_payload_bytes(self, cfg: dict[str, Any]) -> int:
+        return min(
+            2 * 1024 * 1024 + 65536,
+            max(cfg["max_receipt_file_bytes"], cfg["max_message_bytes"] * 2 + 16384, 262144),
+        )
+
+    def _validate_payload_relpath(self, task_id: str, rel: Any, adapter: str | None = None) -> str:
+        if not isinstance(task_id, str) or not TASK_ID_RE.fullmatch(task_id):
+            raise BridgeError("archived_payload_corrupted")
+        if rel is None:
+            return self._payload_relpath_for_task(task_id, adapter or "t3")
+        if adapter == "local" or is_reserved_task_id(task_id):
+            allowed = {f"sent/payloads/{task_id}.json"}
+        else:
+            allowed = {f"sent/payloads/{task_id}.json", f"sent/{task_id}.json"}
+        if not isinstance(rel, str) or rel not in allowed:
+            raise BridgeError("archived_payload_corrupted")
+        return rel
+
     def _verify_pair_continuity(
         self,
         pair_id: str,
@@ -1548,6 +1568,16 @@ class Bridge:
                 expected_sha = prev.get("messageSha256") or (ledger_rec.get("messageSha256") if ledger_rec else None)
                 expected_bytes = prev.get("messageBytes") or (ledger_rec.get("messageBytes") if ledger_rec else None)
                 expected_adapter = prev.get("adapter") or (ledger_rec.get("deliveryAdapter") if ledger_rec else None)
+                try:
+                    valid_rel = self._validate_payload_relpath(tid, prev.get("payloadRelPath"), expected_adapter)
+                    if ledger_rec is not None and "payloadRelPath" in ledger_rec:
+                        rec_rel = self._validate_payload_relpath(tid, ledger_rec.get("payloadRelPath"), expected_adapter)
+                        if prev.get("payloadRelPath") is not None and rec_rel != valid_rel:
+                            raise BridgeError("archived_payload_corrupted")
+                except BridgeError:
+                    self.log("recovery_blocked_noncanonical_payload_path", tid)
+                    pending.discard(tid)
+                    continue
 
                 payload_ok = False
                 try:
@@ -1611,7 +1641,6 @@ class Bridge:
                         adapter_eff = expected_adapter or "t3"
                         if ledger_rec_valid:
                             assert ledger_rec is not None
-                            payload_rel = prev.get("payloadRelPath") or self._payload_relpath_for_task(tid, adapter_eff)
                             payload_doc: dict[str, Any] = {
                                 "schemaVersion": 2,
                                 "taskId": tid,
@@ -1628,7 +1657,7 @@ class Bridge:
                                 payload_doc["unregisteredReceipt"] = True
                             if raw_obj.get("target") is not None:
                                 payload_doc["target"] = raw_obj["target"]
-                            atomic_json(self.root / payload_rel, payload_doc)
+                            atomic_json(self.root / valid_rel, payload_doc)
                             atomic_json(receipt_abs, ledger_rec)
                             path.unlink()
                             fsync_dir(path.parent)
@@ -1731,12 +1760,17 @@ class Bridge:
 
             # Cutpoint (d): local interrupted in sending
             if adapter == "local":
-                payload_rel = prev.get("payloadRelPath") or self._payload_relpath_for_task(tid, "local")
+                try:
+                    payload_rel = self._validate_payload_relpath(tid, prev.get("payloadRelPath"), "local")
+                except BridgeError:
+                    self.log("recovery_blocked_noncanonical_payload_path", tid)
+                    pending.discard(tid)
+                    continue
                 payload_abs = self.root / payload_rel
                 recovered = False
                 try:
                     if payload_abs.exists() and not payload_abs.is_symlink():
-                        p_obj = decode_json(read_bytes(payload_abs, cfg["max_receipt_file_bytes"]))
+                        p_obj = decode_json(read_bytes(payload_abs, self._max_archived_payload_bytes(cfg)))
                         if (
                             isinstance(p_obj, dict)
                             and p_obj.get("taskId") == tid
@@ -1801,11 +1835,15 @@ class Bridge:
                 continue
             adapter = t_rec.get("adapter") or "t3"
             if adapter == "local":
-                payload_rel = t_rec.get("payloadRelPath") or self._payload_relpath_for_task(tid, "local")
+                try:
+                    payload_rel = self._validate_payload_relpath(tid, t_rec.get("payloadRelPath"), "local")
+                except BridgeError:
+                    self.log("recovery_blocked_noncanonical_payload_path", tid)
+                    continue
                 payload_abs = self.root / payload_rel
                 if payload_abs.exists() and not payload_abs.is_symlink():
                     try:
-                        p_obj = decode_json(read_bytes(payload_abs, cfg["max_receipt_file_bytes"]))
+                        p_obj = decode_json(read_bytes(payload_abs, self._max_archived_payload_bytes(cfg)))
                         if (
                             isinstance(p_obj, dict)
                             and p_obj.get("taskId") == tid
@@ -2232,7 +2270,7 @@ class Bridge:
             if path.name.startswith((".", "_")) or path.is_symlink():
                 continue
             try:
-                env = decode_json(read_bytes(path, 524288))
+                env = decode_json(read_bytes(path, IN_FLIGHT_ENVELOPE_READ_MAX_BYTES))
                 if isinstance(env, dict) and isinstance(env.get("pairId"), str) and isinstance(env.get("taskId"), str):
                     result[env["pairId"]] = env["taskId"]
             except Exception:
@@ -2241,7 +2279,11 @@ class Bridge:
             with file_lock(self.root / ".ledger.lock"):
                 ld = self.ledger()
             for tid, d in ld["dispatches"].items():
-                if isinstance(d, dict) and d.get("status") == "dispatching" and isinstance(d.get("pairId"), str):
+                if (
+                    isinstance(d, dict)
+                    and d.get("status") in ("dispatching", "in_flight", "needs_attention", "captured_to_outbox")
+                    and isinstance(d.get("pairId"), str)
+                ):
                     result.setdefault(d["pairId"], tid)
         except Exception:
             pass
@@ -2299,8 +2341,17 @@ class Bridge:
         for path in in_flight_files:
             if path.name.startswith((".", "_")) or path.is_symlink():
                 continue
+            cand_tid = path.name[:-len(".task.json")] if path.name.endswith(".task.json") else None
+            if isinstance(cand_tid, str) and TASK_ID_RE.fullmatch(cand_tid):
+                t_pre = ledger_snap["tasks"].get(cand_tid)
+                if isinstance(t_pre, dict) and t_pre.get("status") == "sent":
+                    continue
+                d_pre = ledger_snap["dispatches"].get(cand_tid)
+                if isinstance(d_pre, dict) and "status" in d_pre and "pairId" in d_pre:
+                    continue
             try:
-                task = decode_json(read_bytes(path, cfg["max_inbox_bytes"]))
+                in_flight_limit = max(cfg["max_inbox_bytes"], IN_FLIGHT_ENVELOPE_READ_MAX_BYTES)
+                task = decode_json(read_bytes(path, in_flight_limit))
             except Exception:
                 self.move(path, "failed")
                 continue
@@ -2361,27 +2412,36 @@ class Bridge:
     def process_in_flight(self, cfg: dict[str, Any], probes: dict[str, Any]) -> None:
         self.reconcile_legacy_in_flight(cfg)
         in_flight_files = sorted((self.root / "inbox/in_flight").glob("*.task.json"))
-        if not in_flight_files:
+        with file_lock(self.root / ".ledger.lock"):
+            ledger_snap = self.ledger()
+        has_active_dispatches = any(
+            isinstance(d, dict) and d.get("status") in ("in_flight", "needs_attention", "captured_to_outbox")
+            for d in ledger_snap["dispatches"].values()
+        )
+        if not in_flight_files and not has_active_dispatches:
             return
         pairs_data = self.pairs()
         now_mono = time.monotonic()
+        in_flight_limit = max(cfg["max_inbox_bytes"], IN_FLIGHT_ENVELOPE_READ_MAX_BYTES)
 
-        with file_lock(self.root / ".ledger.lock"):
-            ledger_snap = self.ledger()
-
-        remaining: list[tuple[Path, dict[str, Any]]] = []
+        remaining: list[tuple[Path | None, dict[str, Any]]] = []
+        seen_tids: set[str] = set()
         for path in in_flight_files:
             if path.name.startswith((".", "_")) or path.is_symlink():
                 continue
             try:
-                task = decode_json(read_bytes(path, cfg["max_inbox_bytes"]))
+                task = decode_json(read_bytes(path, in_flight_limit))
             except Exception:
+                self.move(path, "failed")
+                continue
+            if not isinstance(task, dict):
                 self.move(path, "failed")
                 continue
             tid = task.get("taskId")
             if not isinstance(tid, str) or not TASK_ID_RE.fullmatch(tid):
                 self.move(path, "failed")
                 continue
+            seen_tids.add(tid)
             t_rec = ledger_snap["tasks"].get(tid)
             # First clean up any task already marked sent in ledger
             if t_rec and t_rec.get("status") == "sent":
@@ -2400,11 +2460,34 @@ class Bridge:
                 continue
             remaining.append((path, task))
 
+        for tid, d_rec in ledger_snap["dispatches"].items():
+            if tid in seen_tids or not isinstance(d_rec, dict):
+                continue
+            if d_rec.get("status") not in ("in_flight", "needs_attention", "captured_to_outbox"):
+                continue
+            t_rec = ledger_snap["tasks"].get(tid)
+            if t_rec and t_rec.get("status") == "sent":
+                with self.ledger_tx() as ld:
+                    if tid in ld["dispatches"]:
+                        ld["dispatches"][tid].update(status="completed", updatedAt=now_iso())
+                continue
+            if (self.root / "outbox" / f"{tid}.json").exists():
+                continue
+            remaining.append((
+                None,
+                {
+                    "taskId": tid,
+                    "pairId": d_rec.get("pairId", ""),
+                    "replyThreadId": d_rec.get("replyThreadId"),
+                    "replyMode": d_rec.get("replyMode"),
+                },
+            ))
+
         if not remaining:
             return
 
         # Timeout check doesn't require GUI access
-        still_active: list[tuple[Path, dict[str, Any]]] = []
+        still_active: list[tuple[Path | None, dict[str, Any]]] = []
         for path, task in remaining:
             tid = task["taskId"]
             d_rec = ledger_snap["dispatches"].get(tid, {})
@@ -2422,7 +2505,8 @@ class Bridge:
                     if d_rec.get("status") == "needs_attention"
                     else "max_task_wait_exceeded"
                 )
-                self.move(path, "failed")
+                if path is not None and path.exists() and not path.is_symlink():
+                    self.move(path, "failed")
                 self.notify("Gemini Task Timeout", f"Task {tid} exceeded {cfg['max_task_wait_seconds']}s without completion.", cfg["notifications"])
                 with self.ledger_tx() as ld:
                     ld["dispatches"].setdefault(tid, {}).update(
@@ -2465,7 +2549,8 @@ class Bridge:
                 # Legacy v2.0 in_flight envelope without ledger dispatch snapshot
                 pair = pairs_data["pairs"].get(pid_name)
                 if not pair or not pair.get("enabled", True) or pair_adapter(pair) != "t3":
-                    self.move(path, "failed")
+                    if path is not None and path.exists() and not path.is_symlink():
+                        self.move(path, "failed")
                     continue
                 d_rec = {
                     "pairId": pid_name,
@@ -2478,7 +2563,8 @@ class Bridge:
             else:
                 ok_cont, pair = self._verify_pair_continuity(pid_name, d_rec, pairs_data)
                 if not ok_cont or pair is None:
-                    self.move(path, "failed")
+                    if path is not None and path.exists() and not path.is_symlink():
+                        self.move(path, "failed")
                     with self.ledger_tx() as ld:
                         ld["dispatches"].setdefault(tid, {}).update(
                             status="failed", reason="pair_rebound_or_removed", updatedAt=now_iso()
@@ -2694,24 +2780,34 @@ class Bridge:
         for path in inbox_files:
             if self.stop:
                 break
-            tid: str | None = None
+            file_tid = path.name[:-len(".task.json")] if path.name.endswith(".task.json") else None
+            if not isinstance(file_tid, str) or not TASK_ID_RE.fullmatch(file_tid):
+                file_tid = None
             try:
                 task = decode_json(read_bytes(path, cfg["max_inbox_bytes"]))
-                tid = task.get("taskId")
+                if not isinstance(task, dict):
+                    raise BridgeError("invalid_inbox_task")
+                body_tid = task.get("taskId")
                 pid_name = task.get("pairId")
                 msg = task.get("message")
                 reply_tid = task.get("replyThreadId")
                 if (
-                    not isinstance(tid, str)
-                    or not TASK_ID_RE.fullmatch(tid)
-                    or path.name != f"{tid}.task.json"
+                    file_tid is None
+                    or not isinstance(body_tid, str)
+                    or body_tid != file_tid
                     or not isinstance(pid_name, str)
                     or not isinstance(msg, str)
                     or not msg.strip()
                 ):
                     raise BridgeError("invalid_inbox_task")
+                tid = file_tid
             except (BridgeError, OSError) as exc:
-                self._reject_inbox_task(path, tid, str(exc) if isinstance(exc, BridgeError) else "io_error")
+                self._reject_inbox_task(
+                    path,
+                    file_tid,
+                    str(exc) if isinstance(exc, BridgeError) else "io_error",
+                    from_filename=True,
+                )
                 continue
 
             with file_lock(self.root / ".pairs.lock"):
@@ -3365,11 +3461,9 @@ class Bridge:
 
         candidates: list[Path] = []
         rel = t_rec.get("payloadRelPath")
-        if isinstance(rel, str):
-            expected_allowed = {f"sent/payloads/{task_id}.json", f"sent/{task_id}.json"}
-            if rel not in expected_allowed:
-                raise BridgeError("archived_payload_corrupted")
-            candidates.append(self.root / rel)
+        if rel is not None:
+            valid_rel = self._validate_payload_relpath(task_id, rel, t_rec.get("adapter"))
+            candidates.append(self.root / valid_rel)
         else:
             candidates.append(self.root / "sent/payloads" / f"{task_id}.json")
             candidates.append(self.root / "sent" / f"{task_id}.json")
@@ -3386,7 +3480,7 @@ class Bridge:
             raise BridgeError("historical_payload_unavailable")
 
         try:
-            raw = read_bytes(target_path, cfg["max_inbox_bytes"])
+            raw = read_bytes(target_path, self._max_archived_payload_bytes(cfg))
             obj = decode_json(raw)
         except (BridgeError, OSError):
             raise BridgeError("archived_payload_corrupted") from None

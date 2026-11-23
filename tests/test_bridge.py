@@ -2171,6 +2171,188 @@ class BridgePhase1Tests(unittest.TestCase):
         self.assertEqual(disk_rec["t3"], {"runId": "orig-run"})
         self.assertEqual(self.bridge.read_task_payload(tid)["message"], h_msg)
 
+    def test_review3_p1_noncanonical_payload_relpath_blocked_and_keeps_sending(self) -> None:
+        with mock.patch("sys.stdout", new=io.StringIO()):
+            tb.cmd_pair(
+                self.bridge,
+                argparse.Namespace(
+                    pair_cmd="add", id="loc_r3_path", adapter="local", t3_thread=None,
+                    gemini_title="Gem-R3Path", reply_to=None, label=None, workspace=None,
+                    route="gemini", reply_mode="auto", force=False,
+                ),
+            )
+        loc_uid = self.bridge.pairs()["pairs"]["loc_r3_path"]["pairUid"]
+        tid = "noncanon-cutb-1"
+        msg = "Must not write outside sent/"
+        sha_m, bytes_m = tb.sha256_text(msg)
+        tb.atomic_json(self.root / "sending" / f"{tid}.json", {
+            "taskId": tid, "pairId": "loc_r3_path", "pairUid": loc_uid, "message": msg,
+        })
+        tb.atomic_json(self.root / "sent" / f"{tid}.receipt.json", {
+            "schemaVersion": 2, "taskId": tid, "accepted": True, "deliveryAdapter": "local",
+            "messageSha256": sha_m, "messageBytes": bytes_m,
+        })
+        with self.bridge.ledger_tx() as ld:
+            ld["tasks"][tid] = {
+                "status": "sent", "adapter": "local", "pairId": "loc_r3_path", "pairUid": loc_uid,
+                "payloadRelPath": "../escape.json",
+                "messageSha256": sha_m, "messageBytes": bytes_m,
+            }
+            ld["dispatches"][tid] = {
+                "status": "completed", "adapter": "local", "pairId": "loc_r3_path", "pairUid": loc_uid,
+            }
+
+        self.bridge.scan(recover=True)
+        self.assertFalse((self.root.parent / "escape.json").exists())
+        self.assertTrue((self.root / "sending" / f"{tid}.json").exists())
+        with self.assertRaises(tb.BridgeError) as cm_read:
+            self.bridge.read_task_payload(tid)
+        self.assertEqual(str(cm_read.exception), "archived_payload_corrupted")
+
+    def test_review3_p1_sent_reply_reads_and_waits_despite_small_max_inbox_bytes(self) -> None:
+        with mock.patch("sys.stdout", new=io.StringIO()):
+            tb.cmd_pair(
+                self.bridge,
+                argparse.Namespace(
+                    pair_cmd="add", id="loc_r3_size", adapter="local", t3_thread=None,
+                    gemini_title="Gem-R3Size", reply_to=None, label=None, workspace=None,
+                    route="gemini", reply_mode="auto", force=False,
+                ),
+            )
+        self.ax.add_conv("Gem-R3Size")
+        cfg = self.bridge.config()
+        cfg["max_inbox_bytes"] = 512
+        self.bridge.save_config(cfg)
+
+        self.bridge.submit_task(pair_id="loc_r3_size", message="Short prompt", task_id="small-in-big-out")
+        self.bridge.scan(recover=False)
+        self.assertEqual(self.bridge.get_task_status("small-in-big-out")["status"], "in_flight")
+
+        big_reply = "R" * 700
+        tb.atomic_json(self.root / "outbox/small-in-big-out.json", {
+            "taskId": "small-in-big-out", "pairId": "loc_r3_size", "message": big_reply,
+        })
+        self.bridge.scan(recover=False)
+        self.assertEqual(self.bridge.read_task_payload("small-in-big-out")["message"], big_reply)
+        rc_w, out_w = self.bridge.wait_for_task("small-in-big-out", timeout_s=1.0)
+        self.assertEqual(rc_w, 0)
+        self.assertTrue(out_w["ok"])
+        self.assertEqual(out_w["message"], big_reply)
+
+    def test_review3_p1_in_flight_survives_lowered_max_inbox_bytes_and_missing_file(self) -> None:
+        with mock.patch("sys.stdout", new=io.StringIO()):
+            tb.cmd_pair(
+                self.bridge,
+                argparse.Namespace(
+                    pair_cmd="add", id="loc_r3_if", adapter="local", t3_thread=None,
+                    gemini_title="Gem-R3IF", reply_to=None, label=None, workspace=None,
+                    route="gemini", reply_mode="auto", force=False,
+                ),
+            )
+            tb.cmd_pair(
+                self.bridge,
+                argparse.Namespace(
+                    pair_cmd="add", id="loc_r3_miss", adapter="local", t3_thread=None,
+                    gemini_title="Gem-R3Miss", reply_to=None, label=None, workspace=None,
+                    route="gemini", reply_mode="auto", force=False,
+                ),
+            )
+        self.ax.add_conv("Gem-R3IF")
+        self.ax.add_conv("Gem-R3Miss")
+
+        # 1. Start 460-byte task in_flight (> 512-byte envelope), then shrink max_inbox_bytes = 512
+        self.bridge.submit_task(pair_id="loc_r3_if", message="P" * 460, task_id="if-shrink-1")
+        self.bridge.scan(recover=False)
+        self.assertEqual(self.bridge.get_task_status("if-shrink-1")["status"], "in_flight")
+        in_fl_file = self.root / "inbox/in_flight/if-shrink-1.task.json"
+        self.assertGreater(in_fl_file.stat().st_size, 512)
+
+        cfg = self.bridge.config()
+        cfg["max_inbox_bytes"] = 512
+        self.bridge.save_config(cfg)
+
+        # Queue a second short task on same pair -> must stay queued (same-pair isolation), if-shrink-1 stays in_flight
+        self.bridge.submit_task(pair_id="loc_r3_if", message="Short 2nd", task_id="if-shrink-2")
+        self.bridge.scan(recover=False)
+        self.assertTrue(in_fl_file.exists())
+        self.assertFalse((self.root / "failed/if-shrink-1.task.json").exists())
+        self.assertEqual(self.bridge.get_task_status("if-shrink-1")["status"], "in_flight")
+        self.assertEqual(self.bridge.get_task_status("if-shrink-2")["status"], "queued")
+
+        # Simulate 2 hours elapsed -> transitions cleanly to timed_out (never hangs forever), then 2nd dispatches
+        with self.bridge.ledger_tx() as ld:
+            ld["dispatches"]["if-shrink-1"]["dispatchedMono"] = time.monotonic() - 7200.0
+        self.bridge.scan(recover=False)
+        self.assertEqual(self.bridge.get_task_status("if-shrink-1")["status"], "timed_out")
+        self.assertEqual(self.bridge.get_task_status("if-shrink-2")["status"], "in_flight")
+
+        # 2. Missing inbox/in_flight file for an active dispatch still preserves isolation, accepts outbox, and unblocks queued 2nd task
+        cfg["max_inbox_bytes"] = 262144
+        self.bridge.save_config(cfg)
+        self.bridge.submit_task(pair_id="loc_r3_miss", message="Active missing file", task_id="if-miss-1")
+        self.bridge.scan(recover=False)
+        self.assertEqual(self.bridge.get_task_status("if-miss-1")["status"], "in_flight")
+        (self.root / "inbox/in_flight/if-miss-1.task.json").unlink()
+
+        self.bridge.submit_task(pair_id="loc_r3_miss", message="Waiting 2nd", task_id="if-miss-2")
+        self.bridge.scan(recover=False)
+        self.assertEqual(self.bridge.get_task_status("if-miss-1")["status"], "in_flight")
+        self.assertEqual(self.bridge.get_task_status("if-miss-2")["status"], "queued")
+
+        tb.atomic_json(self.root / "outbox/if-miss-1.json", {
+            "taskId": "if-miss-1", "pairId": "loc_r3_miss", "message": "Reply despite missing in_flight file",
+        })
+        self.bridge.scan(recover=False)
+        self.assertEqual(self.bridge.get_task_status("if-miss-1")["status"], "sent")
+        self.assertEqual(self.bridge.get_task_status("if-miss-2")["status"], "in_flight")
+
+    def test_review3_p1_nondict_json_and_mismatched_task_id_isolate_correctly(self) -> None:
+        with mock.patch("sys.stdout", new=io.StringIO()):
+            tb.cmd_pair(
+                self.bridge,
+                argparse.Namespace(
+                    pair_cmd="add", id="loc_a", adapter="local", t3_thread=None,
+                    gemini_title="Gem-R3A", reply_to=None, label=None, workspace=None,
+                    route="gemini", reply_mode="auto", force=False,
+                ),
+            )
+            tb.cmd_pair(
+                self.bridge,
+                argparse.Namespace(
+                    pair_cmd="add", id="loc_b", adapter="local", t3_thread=None,
+                    gemini_title="Gem-R3B", reply_to=None, label=None, workspace=None,
+                    route="gemini", reply_mode="auto", force=False,
+                ),
+            )
+        self.ax.add_conv("Gem-R3A")
+        self.ax.add_conv("Gem-R3B")
+
+        # 1. Valid non-dict JSON list at head of inbox MUST NOT crash scan or block subsequent valid tasks
+        (self.root / "inbox/000-nondict.task.json").write_text('["not", "an", "object"]', encoding="utf-8")
+        self.bridge.submit_task(pair_id="loc_a", message="Valid after nondict", task_id="001-after-nondict")
+        self.bridge.scan(recover=False)
+        self.assertTrue((self.root / "failed/000-nondict.task.json").exists())
+        self.assertFalse((self.root / "inbox/000-nondict.task.json").exists())
+        self.assertEqual(self.bridge.get_task_status("001-after-nondict")["status"], "in_flight")
+        # Finish 001 so loc_a is free
+        tb.atomic_json(self.root / "outbox/001-after-nondict.json", {"taskId": "001-after-nondict", "pairId": "loc_a", "message": "done"})
+        self.bridge.scan(recover=False)
+
+        # 2. Tampered file `task-a.task.json` claiming `taskId: "task-b"` must fail ONLY `task-a`, leaving `task-b` untouched & dispatched!
+        self.bridge.submit_task(pair_id="loc_a", message="Legit A", task_id="task-a")
+        self.bridge.submit_task(pair_id="loc_b", message="Legit B", task_id="task-b")
+        loc_a_uid = self.bridge.pairs()["pairs"]["loc_a"]["pairUid"]
+        tb.atomic_json(self.root / "inbox/task-a.task.json", {
+            "schemaVersion": 2, "taskId": "task-b", "pairId": "loc_a", "pairUid": loc_a_uid,
+            "replyThreadId": None, "replyMode": "auto", "message": "Spoof B from A",
+        })
+        self.bridge.scan(recover=False)
+        self.assertTrue((self.root / "failed/task-a.task.json").exists())
+        st_a = self.bridge.get_task_status("task-a")
+        self.assertEqual(st_a["status"], "failed")
+        self.assertEqual(st_a["reason"], "invalid_inbox_task")
+        self.assertEqual(self.bridge.get_task_status("task-b")["status"], "in_flight")
+
 
 if __name__ == "__main__":
     unittest.main()

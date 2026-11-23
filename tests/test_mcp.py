@@ -529,6 +529,45 @@ class McpServerTests(unittest.TestCase):
             rc, _ = c.close()
             self.assertEqual(rc, 0)
 
+    def test_08_small_max_inbox_bytes_reads_and_waits_large_reply(self) -> None:
+        cfg = self.bridge.config()
+        cfg["max_inbox_bytes"] = 512
+        self.bridge.save_config(cfg)
+
+        c = McpClient(self.root, ["--allow-pairs", "loc_a"], self.base_env)
+        try:
+            c.send({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18"}})
+            c.recv()
+
+            c.send({
+                "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                "params": {"name": "gemini_send", "arguments": {"pair_id": "loc_a", "message": "Short req"}},
+            })
+            r_send = c.recv(timeout=2.0)["result"]
+            self.assertFalse(r_send["isError"])
+            tid = r_send["structuredContent"]["taskId"]
+
+            with self.bridge.ledger_tx() as ld:
+                ld["dispatches"][tid]["status"] = "in_flight"
+            big_reply = "R" * 700
+            tb.atomic_json(self.root / "outbox" / f"{tid}.json", {
+                "taskId": tid, "pairId": "loc_a", "pairUid": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "message": big_reply,
+            })
+            self.bridge.process_outbox(self.bridge.config())
+
+            c.send({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "gemini_read", "arguments": {"task_id": tid}}})
+            r_read = c.recv(timeout=2.0)["result"]
+            self.assertFalse(r_read["isError"])
+            self.assertEqual(r_read["structuredContent"]["message"], big_reply)
+
+            c.send({"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {"name": "gemini_wait", "arguments": {"task_id": tid, "timeout_seconds": 1}}})
+            r_wait = c.recv(timeout=2.0)["result"]
+            self.assertFalse(r_wait["isError"])
+            self.assertEqual(r_wait["structuredContent"]["message"], big_reply)
+        finally:
+            rc, _ = c.close()
+            self.assertEqual(rc, 0)
+
 
 if __name__ == "__main__":
     unittest.main()
