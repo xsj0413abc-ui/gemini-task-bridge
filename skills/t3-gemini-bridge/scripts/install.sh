@@ -11,7 +11,7 @@ usage() {
   cat <<'EOF'
 Usage: install.sh [options]
 
-Install the T3 Code <-> Gemini Desktop bridge scripts and CLI wrapper locally
+Install the Gemini Desktop bridge scripts, MCP server, and CLI wrapper locally
 without overwriting any existing pairs.json, bridge_config.json, ledger.json,
 or queue directories.
 
@@ -62,10 +62,12 @@ if [[ ! "$LABEL" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ]] || [[ "$LABEL" == *"..
   exit 2
 fi
 
-if [[ ! -f "$SCRIPT_DIR/t3_gemini_bridge.py" || ! -f "$SCRIPT_DIR/bridge_ax.py" ]]; then
-  echo "Error: bundled bridge scripts not found in $SCRIPT_DIR" >&2
-  exit 1
-fi
+for f in t3_gemini_bridge.py bridge_ax.py mcp_server.py; do
+  if [[ ! -f "$SCRIPT_DIR/$f" ]]; then
+    echo "Error: bundled bridge script not found: $SCRIPT_DIR/$f" >&2
+    exit 1
+  fi
+done
 
 PY_BIN="$(command -v python3 || true)"
 if [[ -z "$PY_BIN" && -x /usr/bin/python3 ]]; then
@@ -84,9 +86,13 @@ fi
 mkdir -p "$ROOT" "$BIN_DIR"
 chmod 700 "$ROOT"
 
-cp "$SCRIPT_DIR/t3_gemini_bridge.py" "$ROOT/t3_gemini_bridge.py"
-cp "$SCRIPT_DIR/bridge_ax.py" "$ROOT/bridge_ax.py"
-chmod 755 "$ROOT/t3_gemini_bridge.py" "$ROOT/bridge_ax.py"
+# Atomic temp-file + chmod + mv install so running processes never read partially copied files
+for f in t3_gemini_bridge.py bridge_ax.py mcp_server.py; do
+  TMP_F="$ROOT/.${f}.tmp.$$"
+  cp "$SCRIPT_DIR/$f" "$TMP_F"
+  chmod 755 "$TMP_F"
+  mv -f "$TMP_F" "$ROOT/$f"
+done
 
 WRAPPER_TMP="$BIN_DIR/.t3-gemini-bridge.tmp.$$"
 cat > "$WRAPPER_TMP" <<EOF
@@ -96,11 +102,11 @@ export T3_GEMINI_BRIDGE_LABEL="\${T3_GEMINI_BRIDGE_LABEL:-$LABEL}"
 exec $PY_BIN -B "$ROOT/t3_gemini_bridge.py" "\$@"
 EOF
 chmod 755 "$WRAPPER_TMP"
-mv "$WRAPPER_TMP" "$BIN_DIR/t3-gemini-bridge"
+mv -f "$WRAPPER_TMP" "$BIN_DIR/t3-gemini-bridge"
 
 # Initialize directories/config/ledger safely without touching existing state files
-T3_GEMINI_BRIDGE_ROOT="$ROOT" T3_GEMINI_BRIDGE_LABEL="$LABEL" \
-  "$BIN_DIR/t3-gemini-bridge" status --json >/dev/null
+STATUS_JSON="$(T3_GEMINI_BRIDGE_ROOT="$ROOT" T3_GEMINI_BRIDGE_LABEL="$LABEL" \
+  "$BIN_DIR/t3-gemini-bridge" status --json)"
 
 RESOLVED_TCC_PY="$("$PY_BIN" -B -c "import sys; sys.path.insert(0, '$ROOT'); import t3_gemini_bridge as tb; print(tb.resolve_launchagent_python())")"
 
@@ -124,7 +130,20 @@ elif [[ -x "$T3_HOME/bin/t3" ]]; then
 elif command -v t3 >/dev/null 2>&1; then
   echo "  T3 CLI      : $(command -v t3)"
 else
-  echo "  [warn] t3 CLI not found at $T3_HOME/bin/t3 or on PATH (install T3 Code CLI or set T3_GEMINI_BRIDGE_CLI)"
+  echo "  [info] t3 CLI not found (optional; only required for adapter=t3 pairs; adapter=local and MCP work without it)"
+fi
+
+if "$PY_BIN" -c '
+import json, sys
+s = json.loads(sys.stdin.read())
+agent = s.get("agent") or {}
+dh = s.get("daemonHealth") or {}
+caps = dh.get("capabilities") or []
+sys.exit(0 if (agent.get("loaded") and "local_adapter" not in caps) else 1)
+' <<< "$STATUS_JSON" 2>/dev/null; then
+  echo ""
+  echo "  [notice] An older LaunchAgent daemon is currently running on $ROOT without v2.1 capabilities."
+  echo "           Follow the controlled cutover steps (mode t3-all -> drain -> bootout -> bootstrap) before adding local pairs."
 fi
 
 case ":$PATH:" in

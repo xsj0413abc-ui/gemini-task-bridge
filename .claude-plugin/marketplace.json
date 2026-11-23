@@ -5,16 +5,20 @@
     "name": "xsj0413abc-ui",
     "url": "https://github.com/xsj0413abc-ui"
   },
-  "description": "Automated 1-to-1 bridge between T3 Code threads and Google Gemini Desktop Task conversations on macOS.",
+  "description": "Zero-dependency 1-to-1 bridge, task CLI, and stdio MCP server connecting T3 Code, Claude Code, Codex, and Antigravity with Google Gemini Desktop Task conversations on macOS.",
   "plugins": [
     {
       "name": "t3-gemini-bridge",
       "source": "./",
-      "description": "Zero-dependency 1-to-1 bidirectional bridge and Agent Skill for T3 Code <-> Gemini Desktop Task mode with instant T3-only rollback.",
+      "description": "Zero-dependency 1-to-1 bridge, CLI task runner, and stdio MCP server connecting T3 Code, Claude Code, Codex, and Antigravity with Google Gemini Desktop Task mode on macOS.",
       "category": "productivity",
       "keywords": [
         "t3-code",
+        "claude-code",
+        "codex",
+        "antigravity",
         "gemini",
+        "mcp",
         "bridge",
         "macos",
         "skills"

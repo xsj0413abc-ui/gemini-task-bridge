@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import io
 import json
 import os
@@ -11,6 +12,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from unittest import mock
@@ -698,6 +700,921 @@ class BridgeUnitTests(unittest.TestCase):
         lbl, plist_path = tb._validated_label("io.example.t3-gemini-bridge")
         self.assertEqual(lbl, "io.example.t3-gemini-bridge")
         self.assertEqual(plist_path.name, "io.example.t3-gemini-bridge.plist")
+
+
+class BridgePhase1Tests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="t3_gem_p1_")).resolve()
+        self.root = self.tmp / "bridge_root"
+        self.la_dir = self.tmp / "launchagents"
+        self.la_dir.mkdir(parents=True)
+        self._env_patch = mock.patch.dict(os.environ, {"T3_GEMINI_BRIDGE_LAUNCHAGENT_DIR": str(self.la_dir)}, clear=False)
+        self._env_patch.start()
+        self.cli_log = self.tmp / "cli_calls.ndjson"
+        self.cli = make_fake_t3_cli(self.tmp, self.cli_log, "ok")
+        self.ax = MockAXDriver()
+        self.bridge = tb.Bridge(
+            root=self.root,
+            cli_path=str(self.cli),
+            t3_home=str(self.tmp / "t3_home"),
+            ax_driver=self.ax,
+        )
+        self.bridge.setup()
+        cfg = self.bridge.config()
+        cfg["notifications"] = False
+        cfg["ax_capture_grace_seconds"] = 0.2
+        self.bridge.save_config(cfg)
+
+    def tearDown(self) -> None:
+        self._env_patch.stop()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _cli_calls(self) -> list[dict]:
+        if not self.cli_log.exists():
+            return []
+        return [json.loads(line) for line in self.cli_log.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+    def test_p0_1_upgrade_gate_blocks_old_daemon_and_keepalive_plist(self) -> None:
+        # 1. Old v2.0 daemon holding .process.lock + legacy .daemon_health.json (no capabilities)
+        legacy_health = {
+            "schemaVersion": 1,
+            "pid": 42424,
+            "startedAt": tb.now_iso(),
+            "lastScanAt": tb.now_iso(),
+            "axTrusted": True,
+            "screenLocked": False,
+            "geminiRunning": True,
+            "geminiPid": 99999,
+            "globalMode": "hybrid",
+            "lastError": None,
+        }
+        tb.atomic_json(self.root / ".daemon_health.json", legacy_health)
+        with tb.file_lock(self.root / ".process.lock", nonblocking=True) as fd:
+            os.ftruncate(fd, 0)
+            os.write(fd, b"42424")
+            with self.assertRaises(tb.BridgeError) as cm:
+                tb.cmd_pair(
+                    self.bridge,
+                    argparse.Namespace(
+                        pair_cmd="add", id="loc1", adapter="local", t3_thread=None,
+                        gemini_title="Gem-Loc-1", reply_to=None, label=None, workspace=None,
+                        route="gemini", reply_mode="auto", force=False,
+                    ),
+                )
+            self.assertEqual(str(cm.exception), "daemon_upgrade_required_for_v21_features")
+
+            # Cross-version legacy T3 send works via compat write path with st_nlink == 1 & no overwritten dispatch
+            with self.bridge.pairs_tx() as pdata:
+                pdata["pairs"]["t3_legacy"] = {
+                    "pairId": "t3_legacy", "label": "t3_legacy", "t3ThreadId": "t-1",
+                    "defaultReplyThreadId": "t-1", "geminiTitle": "Gem-T3", "route": "gemini",
+                    "replyMode": "auto", "enabled": True,
+                }
+            res = self.bridge.submit_task(pair_id="t3_legacy", message="legacy compat send")
+            inbox_f = Path(res["inboxFile"])
+            self.assertTrue(inbox_f.exists())
+            self.assertEqual(os.stat(inbox_f).st_nlink, 1)
+            with tb.file_lock(self.root / ".ledger.lock"):
+                self.assertNotIn(res["taskId"], self.bridge.ledger()["dispatches"])
+
+        # 2. Unlocked .process.lock BUT KeepAlive v2.0 LaunchAgent loaded=True -> STILL blocked!
+        old_script = self.tmp / "old_v20_bridge.py"
+        old_script.write_text("#!/usr/bin/python3\n# v2.0 script without BRIDGE_VERSION\n", encoding="utf-8")
+        plist_file = self.la_dir / "io.test.old.plist"
+        import plistlib
+        plist_file.write_bytes(plistlib.dumps({
+            "Label": "io.test.old",
+            "ProgramArguments": ["/usr/bin/python3", str(old_script), "--root", str(self.root), "run"],
+            "EnvironmentVariables": {"T3_GEMINI_BRIDGE_ROOT": str(self.root)},
+            "KeepAlive": True,
+        }))
+        with mock.patch.object(tb, "agent_info", return_value={"loaded": True, "state": "spawn scheduled"}):
+            ok, reason = self.bridge.check_v21_runtime_for_root(self.bridge.config())
+            self.assertFalse(ok)
+            self.assertEqual(reason, "daemon_upgrade_required_for_v21_features")
+
+        # 3. Controlled offline upgraded plist (loaded=False, v2.1 script on disk) -> allowed
+        new_script = self.tmp / "new_v21_bridge.py"
+        new_script.write_text('#!/usr/bin/python3\nBRIDGE_VERSION = "2.1.0"\n', encoding="utf-8")
+        plist_file.write_bytes(plistlib.dumps({
+            "Label": "io.test.old",
+            "ProgramArguments": ["/usr/bin/python3", str(new_script), "--root", str(self.root), "run"],
+            "EnvironmentVariables": {"T3_GEMINI_BRIDGE_ROOT": str(self.root)},
+        }))
+        with mock.patch.object(tb, "agent_info", return_value={"loaded": False}):
+            ok2, _ = self.bridge.check_v21_runtime_for_root(self.bridge.config())
+            self.assertTrue(ok2)
+
+    def test_p0_a_single_link_publish_continuous_sweep_and_live_writer_protection(self) -> None:
+        with mock.patch("sys.stdout", new=io.StringIO()):
+            tb.cmd_pair(
+                self.bridge,
+                argparse.Namespace(
+                    pair_cmd="add", id="loc1", adapter="local", t3_thread=None,
+                    gemini_title="Gem-Loc-1", reply_to=None, label=None, workspace=None,
+                    route="gemini", reply_mode="auto", force=False,
+                ),
+            )
+        self.ax.add_conv("Gem-Loc-1")
+
+        # Simulate Stage 2 crash after ledger reservation but before Stage 3 publish
+        tid = "staged-recover-1"
+        msg = "Hello single-link world"
+        req_sha, _ = tb.sha256_text(msg)
+        stage_name = f"._stage.{tid}.deaddead.task.json"
+        stage_path = self.root / "inbox" / stage_name
+        tb.atomic_json(stage_path, {
+            "schemaVersion": 2, "taskId": tid, "pairId": "loc1",
+            "replyThreadId": None, "replyMode": "auto", "message": msg, "createdAt": tb.now_iso(),
+        })
+        with tb.file_lock(self.root / ".pairs.lock"):
+            p_uid = self.bridge.pairs()["pairs"]["loc1"]["pairUid"]
+        with self.bridge.ledger_tx() as ld:
+            ld["dispatches"][tid] = {
+                "status": "queued", "deliveryKind": "gemini_reply", "pairId": "loc1",
+                "pairUid": p_uid, "adapter": "local", "geminiTitle": "Gem-Loc-1",
+                "replyThreadId": None, "requestSha256": req_sha,
+                "stagingFile": stage_name, "published": False, "createdAt": tb.now_iso(),
+            }
+
+        # Live writer holding flock on an unreferenced staging file MUST NOT be swept
+        live_orphan = self.root / "inbox/._stage.livewriter-1.beefbeef.task.json"
+        live_fd = os.open(str(live_orphan), os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        fcntl.flock(live_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        try:
+            # Running continuous scan(recover=False) reconciles crashed staged intake without restart!
+            self.bridge.scan(recover=False)
+            self.assertTrue(live_orphan.exists())
+            self.assertFalse(stage_path.exists())
+            self.assertTrue((self.root / "inbox/in_flight" / f"{tid}.task.json").exists())
+            self.assertEqual(os.stat(self.root / "inbox/in_flight" / f"{tid}.task.json").st_nlink, 1)
+        finally:
+            os.close(live_fd)
+
+        # Once live writer releases lock, next scan sweeps orphan staging safely
+        self.bridge.scan(recover=False)
+        self.assertFalse(live_orphan.exists())
+
+        # Duplicate task_id submit_task fails cleanly with EEXIST protection
+        with self.assertRaises(tb.BridgeError) as cm:
+            self.bridge.submit_task(pair_id="loc1", message="dup", task_id=tid)
+        self.assertEqual(str(cm.exception), "duplicate_task_id")
+
+    def test_condition1_step_c_relock_prevents_submitting_to_wrong_chat(self) -> None:
+        with mock.patch("sys.stdout", new=io.StringIO()):
+            tb.cmd_pair(
+                self.bridge,
+                argparse.Namespace(
+                    pair_cmd="add", id="loc1", adapter="local", t3_thread=None,
+                    gemini_title="Gem-Target", reply_to=None, label=None, workspace=None,
+                    route="gemini", reply_mode="auto", force=False,
+                ),
+            )
+        self.ax.add_conv("Gem-Target")
+        self.ax.add_conv("Gem-Other")
+
+        # Hook open_conversation so on the 2nd open (Step C re-lock), window title drifts to Gem-Other
+        orig_open = self.ax.open_conversation
+        open_calls = [0]
+
+        def drifting_open(pid: int, title: str, timeout_s: float = 3.0) -> tuple[bool, str]:
+            open_calls[0] += 1
+            if open_calls[0] >= 2:
+                self.ax.current_title = "Gem-Other"
+                return True, "sidebar"
+            return orig_open(pid, title, timeout_s)
+
+        self.ax.open_conversation = drifting_open
+        res = self.bridge.submit_task(pair_id="loc1", message="Target only", task_id="cond1-1")
+        self.assertEqual(res["taskId"], "cond1-1")
+        self.bridge.scan(recover=False)
+        self.assertEqual(self.ax.injected_prompts, [])
+        with tb.file_lock(self.root / ".ledger.lock"):
+            d = self.bridge.ledger()["dispatches"]["cond1-1"]
+        self.assertEqual(d["status"], "queued")
+
+    def test_condition2_press_uncertain_no_autorepress_and_same_scan_reconcile(self) -> None:
+        with mock.patch("sys.stdout", new=io.StringIO()):
+            tb.cmd_pair(
+                self.bridge,
+                argparse.Namespace(
+                    pair_cmd="add", id="loc1", adapter="local", t3_thread=None,
+                    gemini_title="Gem-Uncertain", reply_to=None, label=None, workspace=None,
+                    route="gemini", reply_mode="auto", force=False,
+                ),
+            )
+        self.ax.add_conv("Gem-Uncertain")
+        press_calls = [0]
+
+        def uncertain_submit(pid: int, prompt_text: str) -> tuple[bool, str]:
+            press_calls[0] += 1
+            return False, "submit_press_uncertain"
+
+        self.ax.write_prompt_and_submit = uncertain_submit
+        self.bridge.submit_task(pair_id="loc1", message="Uncertain press", task_id="unc-1")
+        self.bridge.scan(recover=False)
+        # Pressed ONCE, zero auto-repress, and continuous scan reconciled dispatching -> unknown_timeout
+        self.assertEqual(press_calls[0], 1)
+        st = self.bridge.get_task_status("unc-1")
+        self.assertEqual(st["status"], "unknown_timeout")
+        self.assertEqual(st["reason"], "dispatch_submit_outcome_unknown")
+        self.assertTrue((self.root / "failed/unc-1.task.json").exists())
+
+        # Case 2: pressed once, Gemini actually received sentinel even though submit returned uncertain
+        press_calls[0] = 0
+
+        def uncertain_but_sent(pid: int, prompt_text: str) -> tuple[bool, str]:
+            press_calls[0] += 1
+            self.ax.conversations["Gem-Uncertain"]["chunks"].append(prompt_text)
+            return False, "submit_press_uncertain"
+
+        self.ax.write_prompt_and_submit = uncertain_but_sent
+        self.bridge.submit_task(pair_id="loc1", message="Delivered anyway", task_id="unc-2")
+        self.bridge.scan(recover=False)
+        self.assertEqual(press_calls[0], 1)
+        st2 = self.bridge.get_task_status("unc-2")
+        self.assertEqual(st2["status"], "in_flight")
+        self.assertTrue((self.root / "inbox/in_flight/unc-2.task.json").exists())
+
+    def test_condition3_legacy_pair_uid_none_hub_and_spoke_a_not_eq_b(self) -> None:
+        with self.bridge.pairs_tx() as pdata:
+            pdata["pairs"]["role_a"] = {
+                "pairId": "role_a",
+                "label": "Role A",
+                "t3ThreadId": "thread-A",
+                "defaultReplyThreadId": "thread-B",
+                "allowedReplyThreadIds": ["thread-A", "thread-B"],
+                "geminiTitle": "Gem-Role-A",
+                "route": "gemini",
+                "replyMode": "auto",
+                "enabled": True,
+            }
+        self.ax.add_conv("Gem-Role-A")
+        tid = "leg-ab-1"
+        tb.atomic_json(self.root / "inbox/in_flight" / f"{tid}.task.json", {
+            "schemaVersion": 2, "taskId": tid, "pairId": "role_a",
+            "replyThreadId": "thread-B", "replyMode": "auto", "message": "Run A->B",
+        })
+        with self.bridge.ledger_tx() as ld:
+            ld["dispatches"][tid] = {
+                "status": "in_flight",
+                "pairId": "role_a",
+                "geminiTitle": "Gem-Role-A",
+                "replyThreadId": "thread-B",
+                "dispatchedMono": time.monotonic() - 10.0,
+                "baselineTextLen": 0,
+                "baselineChunks": [],
+            }
+        self.ax.current_title = "Gem-Role-A"
+        self.ax.conversations["Gem-Role-A"]["chunks"].extend([
+            "Done from A",
+            f"[[T3_BRIDGE_DONE:{tid}]]",
+        ])
+        self.bridge.scan(recover=False)
+        time.sleep(0.25)
+        self.bridge.scan(recover=False)
+        time.sleep(0.55)
+        self.bridge.scan(recover=False)
+        self.bridge.scan(recover=False)
+        calls = self._cli_calls()
+        self.assertEqual(len(calls), 1)
+        self.assertIn("thread-B", calls[0]["args"])
+        self.assertIn("Done from A", calls[0]["message"])
+
+    def test_condition4_reserved_receipt_suffix_and_two_tier_headroom(self) -> None:
+        with mock.patch("sys.stdout", new=io.StringIO()):
+            tb.cmd_pair(
+                self.bridge,
+                argparse.Namespace(
+                    pair_cmd="add", id="loc1", adapter="local", t3_thread=None,
+                    gemini_title="Gem-Headroom", reply_to=None, label=None, workspace=None,
+                    route="gemini", reply_mode="auto", force=False,
+                ),
+            )
+        self.ax.add_conv("Gem-Headroom")
+
+        for bad in ("demo.receipt", "demo.RECEIPT"):
+            with self.assertRaises(tb.BridgeError) as cm:
+                self.bridge.submit_task(pair_id="loc1", message="bad id", task_id=bad)
+            self.assertEqual(str(cm.exception), "reserved_task_id_suffix")
+
+        # Test two-tier headroom: soft intake cap rejects new intake while reserving room for in-flight completion
+        res = self.bridge.submit_task(pair_id="loc1", message="Already queued", task_id="hr-1")
+        self.bridge.scan(recover=False)
+        self.assertEqual(self.bridge.get_task_status(res["taskId"])["status"], "in_flight")
+
+        with mock.patch.object(tb, "LEDGER_INTAKE_MAX_BYTES", 500), mock.patch.object(tb, "LEDGER_HARD_MAX_BYTES", 50000):
+            with self.assertRaises(tb.BridgeError) as cm_cap:
+                self.bridge.submit_task(pair_id="loc1", message="Should fail soft cap", task_id="hr-2")
+            self.assertEqual(str(cm_cap.exception), "ledger_intake_capacity_exceeded")
+
+            # In-flight hr-1 STILL completes cleanly into reserved headroom!
+            tb.atomic_json(self.root / "outbox/hr-1.json", {
+                "taskId": "hr-1", "pairId": "loc1", "message": "Completed inside headroom",
+            })
+            self.bridge.scan(recover=False)
+            payload = self.bridge.read_task_payload("hr-1")
+            self.assertEqual(payload["message"], "Completed inside headroom")
+
+    def test_p0_b_kill_after_ax_submit_and_early_outbox_accepted_in_dispatching(self) -> None:
+        with mock.patch("sys.stdout", new=io.StringIO()):
+            tb.cmd_pair(
+                self.bridge,
+                argparse.Namespace(
+                    pair_cmd="add", id="loc1", adapter="local", t3_thread=None,
+                    gemini_title="Gem-P0B", reply_to=None, label=None, workspace=None,
+                    route="gemini", reply_mode="auto", force=False,
+                ),
+            )
+        self.ax.add_conv("Gem-P0B")
+        self.bridge.submit_task(pair_id="loc1", message="Fast outbox", task_id="fast-disp-1")
+
+        # Manually put task into `dispatching` (simulating crash right after AX submit before in_flight move)
+        with self.bridge.ledger_tx() as ld:
+            ld["dispatches"]["fast-disp-1"]["status"] = "dispatching"
+        # Fast outbox arrives while status == dispatching -> accepted cleanly!
+        tb.atomic_json(self.root / "outbox/fast-disp-1.json", {
+            "taskId": "fast-disp-1", "pairId": "loc1", "message": "Fast reply during dispatching",
+        })
+        self.bridge.scan(recover=True)
+        self.assertEqual(self.bridge.get_task_status("fast-disp-1")["status"], "sent")
+        self.assertEqual(self.bridge.read_task_payload("fast-disp-1")["message"], "Fast reply during dispatching")
+
+    def test_p1_1_all_sending_cutpoints_and_direct_t3_interleave(self) -> None:
+        with mock.patch("sys.stdout", new=io.StringIO()):
+            tb.cmd_pair(
+                self.bridge,
+                argparse.Namespace(
+                    pair_cmd="add", id="loc1", adapter="local", t3_thread=None,
+                    gemini_title="Gem-Loc-Rec", reply_to=None, label=None, workspace=None,
+                    route="gemini", reply_mode="auto", force=False,
+                ),
+            )
+            tb.cmd_pair(
+                self.bridge,
+                argparse.Namespace(
+                    pair_cmd="add", id="t3p", adapter="t3", t3_thread="thread-t3p",
+                    gemini_title="Gem-T3-Rec", reply_to=None, label=None, workspace=None,
+                    route="gemini", reply_mode="auto", force=False,
+                ),
+            )
+        with tb.file_lock(self.root / ".pairs.lock"):
+            loc_uid = self.bridge.pairs()["pairs"]["loc1"]["pairUid"]
+            t3_uid = self.bridge.pairs()["pairs"]["t3p"]["pairUid"]
+
+        # Cutpoint (a): local in sending/ BEFORE tasks pre-claim
+        msg_a = "Local pre-claim reply"
+        tb.atomic_json(self.root / "sending/cut-a-loc.json", {"taskId": "cut-a-loc", "pairId": "loc1", "message": msg_a})
+        with self.bridge.ledger_tx() as ld:
+            ld["dispatches"]["cut-a-loc"] = {
+                "status": "in_flight", "deliveryKind": "gemini_reply", "pairId": "loc1",
+                "pairUid": loc_uid, "adapter": "local", "geminiTitle": "Gem-Loc-Rec",
+                "replyThreadId": None, "requestSha256": tb.sha256_text("req")[0],
+            }
+
+        # Cutpoint (b): already committed sent, sending/ uncleaned
+        msg_b = "Already sent"
+        sha_b, len_b = tb.sha256_text(msg_b)
+        tb.atomic_json(self.root / "sent/payloads/cut-b-loc.json", {"taskId": "cut-b-loc", "pairId": "loc1", "pairUid": loc_uid, "message": msg_b})
+        tb.atomic_json(self.root / "sent/cut-b-loc.receipt.json", {"taskId": "cut-b-loc", "accepted": True, "messageSha256": sha_b})
+        tb.atomic_json(self.root / "sending/cut-b-loc.json", {"taskId": "cut-b-loc", "pairId": "loc1", "message": msg_b})
+        with self.bridge.ledger_tx() as ld:
+            ld["tasks"]["cut-b-loc"] = {"status": "sent", "adapter": "local", "pairId": "loc1", "pairUid": loc_uid, "payloadRelPath": "sent/payloads/cut-b-loc.json", "messageSha256": sha_b, "messageBytes": len_b}
+
+        # Cutpoint (c): t3 receipt already persisted before ledger commit -> recovers as sent WITHOUT resending CLI!
+        msg_c = "Persisted t3 receipt"
+        sha_c, len_c = tb.sha256_text(msg_c)
+        tb.atomic_json(self.root / "sent/cut-c-t3.json", {"taskId": "cut-c-t3", "pairId": "t3p", "pairUid": t3_uid, "message": msg_c})
+        tb.atomic_json(self.root / "sent/cut-c-t3.receipt.json", {"taskId": "cut-c-t3", "deliveryAdapter": "t3", "accepted": True, "t3": {"threadId": "thread-t3p"}, "messageSha256": sha_c, "messageBytes": len_c})
+        tb.atomic_json(self.root / "sending/cut-c-t3.json", {"taskId": "cut-c-t3", "pairId": "t3p", "message": msg_c})
+        with self.bridge.ledger_tx() as ld:
+            ld["tasks"]["cut-c-t3"] = {"status": "sending", "adapter": "t3", "pairId": "t3p", "pairUid": t3_uid, "resolvedThreadId": "thread-t3p", "messageSha256": sha_c, "messageBytes": len_c}
+
+        self.bridge.scan(recover=True)
+        self.assertEqual(self.bridge.read_task_payload("cut-a-loc")["message"], msg_a)
+        self.assertEqual(self.bridge.get_task_status("cut-b-loc")["status"], "sent")
+        self.assertFalse((self.root / "sending/cut-b-loc.json").exists())
+        self.assertEqual(self.bridge.get_task_status("cut-c-t3")["status"], "sent")
+        self.assertEqual(len(self._cli_calls()), 0)
+
+        # Test direct_t3_sending live lock & dead caller transition
+        live_lock = self.root / "locks/direct_t3.dt3-live.lock"
+        fd_live = os.open(str(live_lock), os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+        fcntl.flock(fd_live, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        try:
+            with self.bridge.ledger_tx() as ld:
+                ld["dispatches"]["dt3-live"] = {"status": "direct_t3_sending", "deliveryKind": "direct_t3_forwarded", "pairId": "t3p", "pairUid": t3_uid, "adapter": "t3"}
+                ld["dispatches"]["dt3-dead"] = {"status": "direct_t3_sending", "deliveryKind": "direct_t3_forwarded", "pairId": "t3p", "pairUid": t3_uid, "adapter": "t3"}
+            self.assertEqual(self.bridge.get_task_status("dt3-live")["status"], "direct_t3_sending")
+            self.assertEqual(self.bridge.get_task_status("dt3-dead")["status"], "unknown_timeout")
+        finally:
+            os.close(fd_live)
+
+    def test_p1_2_stage_gates_non_mutation_and_pair_init_none_fix(self) -> None:
+        with mock.patch("sys.stdout", new=io.StringIO()):
+            tb.cmd_pair(
+                self.bridge,
+                argparse.Namespace(
+                    pair_cmd="init", id="loc_init_1", adapter="local", t3_thread=None,
+                    gemini_title="Gem-Init-1", reply_to=None, label=None, workspace=None,
+                    init_prompt=None, reply_mode="auto", wait_sec=5.0,
+                ),
+            )
+            # Creating 2nd local pair via `pair init` MUST succeed (None == None bug fixed!)
+            tb.cmd_pair(
+                self.bridge,
+                argparse.Namespace(
+                    pair_cmd="init", id="loc_init_2", adapter="local", t3_thread=None,
+                    gemini_title="Gem-Init-2", reply_to=None, label=None, workspace=None,
+                    init_prompt=None, reply_mode="auto", wait_sec=5.0,
+                ),
+            )
+        # Reject Gemini outbox for queued task and NEVER mutate queued task status or sent task status!
+        r = self.bridge.submit_task(pair_id="loc_init_1", message="Still queued", task_id="stage-q-1")
+        tb.atomic_json(self.root / "outbox/stage-q-1.json", {"taskId": "stage-q-1", "pairId": "loc_init_1", "message": "Spoof early"})
+        self.bridge.scan(recover=False)
+        # Quarantine moved bad file to failed/, dispatch remains active/queued (not overwritten!)
+        self.assertTrue((self.root / "failed/stage-q-1.json").exists())
+        self.assertEqual(self.bridge.get_task_status(r["taskId"])["status"], "in_flight")
+
+    def test_p1_3_flat_t3_counts_plus_2_doctor_and_cli_exit_codes(self) -> None:
+        # Doctor with only local pair -> t3CliRequired == False
+        with mock.patch("sys.stdout", new=io.StringIO()):
+            tb.cmd_pair(
+                self.bridge,
+                argparse.Namespace(
+                    pair_cmd="add", id="loc1", adapter="local", t3_thread=None,
+                    gemini_title="Gem-Loc-Doc", reply_to=None, label=None, workspace=None,
+                    route="gemini", reply_mode="auto", force=False,
+                ),
+            )
+        with mock.patch("sys.stdout", new=io.StringIO()) as out:
+            tb.cmd_doctor(self.bridge, as_json=True)
+        self.assertFalse(json.loads(out.getvalue())["t3CliRequired"])
+
+        # Add enabled t3 pair -> t3CliRequired == True; complete T3 task increments counts["sent"] by +2
+        with mock.patch("sys.stdout", new=io.StringIO()):
+            tb.cmd_pair(
+                self.bridge,
+                argparse.Namespace(
+                    pair_cmd="add", id="t3p", adapter="t3", t3_thread="thread-t3",
+                    gemini_title="Gem-T3-Flat", reply_to=None, label=None, workspace=None,
+                    route="gemini", reply_mode="auto", force=False,
+                ),
+            )
+        with mock.patch("sys.stdout", new=io.StringIO()) as out2:
+            tb.cmd_doctor(self.bridge, as_json=True)
+        self.assertTrue(json.loads(out2.getvalue())["t3CliRequired"])
+
+        self.ax.add_conv("Gem-T3-Flat")
+        self.bridge.submit_task(pair_id="t3p", message="Run T3", task_id="flat-t3-1")
+        self.bridge.scan(recover=False)
+        tb.atomic_json(self.root / "outbox/flat-t3-1.json", {"taskId": "flat-t3-1", "pairId": "t3p", "message": "Flat reply"})
+        self.bridge.scan(recover=False)
+        self.assertTrue((self.root / "sent/flat-t3-1.json").exists())
+        self.assertTrue((self.root / "sent/flat-t3-1.receipt.json").exists())
+        with mock.patch("sys.stdout", new=io.StringIO()) as sout:
+            tb.cmd_status(self.bridge, as_json=True)
+        self.assertEqual(json.loads(sout.getvalue())["counts"]["sent"], 2)
+
+        # task read works for both t3 and local; mode t3-all rejects local send
+        with mock.patch("sys.stdout", new=io.StringIO()):
+            tb.cmd_mode(self.bridge, "t3-all")
+        with self.assertRaises(tb.BridgeError) as cm_t3only:
+            self.bridge.submit_task(pair_id="loc1", message="Should fail in t3-all")
+        self.assertEqual(str(cm_t3only.exception), "gemini_routing_paused_by_global_mode")
+
+    def test_p1_4_unified_needs_attention_card_priority_and_second_card(self) -> None:
+        with mock.patch("sys.stdout", new=io.StringIO()):
+            tb.cmd_pair(
+                self.bridge,
+                argparse.Namespace(
+                    pair_cmd="add", id="loc1", adapter="local", t3_thread=None,
+                    gemini_title="Gem-Attn-Unified", reply_to=None, label=None, workspace=None,
+                    route="gemini", reply_mode="auto", force=False,
+                ),
+            )
+        self.ax.add_conv("Gem-Attn-Unified")
+        self.bridge.submit_task(pair_id="loc1", message="Two cards", task_id="attn-u-1")
+        self.bridge.scan(recover=False)
+        with self.bridge.ledger_tx() as ld:
+            ld["dispatches"]["attn-u-1"]["dispatchedMono"] = time.monotonic() - 10.0
+
+        # Same sample has BOTH badge == "in_progress" AND confirmation_card -> card MUST win!
+        self.ax.conversations["Gem-Attn-Unified"]["badge"] = "in_progress"
+        self.ax.confirmation_card = "ActionCardRemyConfirmationCard"
+        self.bridge.scan(recover=False)
+        st1 = self.bridge.get_task_status("attn-u-1")
+        self.assertEqual(st1["status"], "needs_attention")
+        self.assertEqual(st1["attentionEpisode"], 1)
+
+        # CLI task wait --return-on-attention returns exit 3 with original taskId
+        rc, out_wait = self.bridge.wait_for_task("attn-u-1", timeout_s=1.0, return_on_attention=True)
+        self.assertEqual(rc, 3)
+        self.assertEqual(out_wait["taskId"], "attn-u-1")
+
+        # Screen locked MUST NOT clear needs_attention
+        self.ax.screen_locked = True
+        self.ax.confirmation_card = None
+        self.ax.conversations["Gem-Attn-Unified"]["badge"] = "in_progress"
+        self.bridge.scan(recover=False)
+        self.assertEqual(self.bridge.get_task_status("attn-u-1")["status"], "needs_attention")
+
+        # Unlock + verified card gone -> exits needs_attention -> in_flight, resetting notifiedAttention
+        self.ax.screen_locked = False
+        self.bridge.scan(recover=False)
+        self.assertEqual(self.bridge.get_task_status("attn-u-1")["status"], "in_flight")
+
+        # 2nd card appears -> re-notifies & attentionEpisode == 2
+        self.ax.confirmation_card = "ActionCardRemyElicitationCard"
+        self.bridge.scan(recover=False)
+        st2 = self.bridge.get_task_status("attn-u-1")
+        self.assertEqual(st2["status"], "needs_attention")
+        self.assertEqual(st2["attentionEpisode"], 2)
+
+    def test_step3_bridge_ax_press_uncertain_vs_not_found(self) -> None:
+        bx = bridge_ax.MacOSAXBridge.__new__(bridge_ax.MacOSAXBridge)
+        bx.cf = mock.Mock()
+        bx.ax = mock.Mock()
+        bx.ax.AXUIElementSetAttributeValue.return_value = 0
+        bx._k_true = object()
+        bx._attr = mock.Mock(side_effect=lambda name: f"attr:{name}")
+        bx._cfstr = mock.Mock(side_effect=lambda s: f"cf:{s}")
+        bx._app_el = mock.Mock(return_value=101)
+        bx._find_main_window = mock.Mock(return_value=202)
+        bx._find_composer = mock.Mock(return_value=303)
+        bx._get_str = mock.Mock(return_value="Prompt body")
+        bx._has_stop_button = mock.Mock(return_value=False)
+
+        # Case 1: button found once and AXPress returns nonzero (-25204) -> submit_press_uncertain, NO retry
+        bx._find_element = mock.Mock(return_value=404)
+        bx.perform_action = mock.Mock(return_value=-25204)
+        ok1, r1 = bx.write_prompt_and_submit(999, "Prompt body")
+        self.assertFalse(ok1)
+        self.assertEqual(r1, "submit_press_uncertain")
+        self.assertEqual(bx.perform_action.call_count, 1)
+
+        # Case 2: button never found -> send_button_not_found_or_disabled, 0 presses
+        bx._find_element = mock.Mock(return_value=None)
+        bx.perform_action = mock.Mock()
+        with (
+            mock.patch.object(bridge_ax.time, "monotonic", side_effect=[0.0, 0.1, 2.0]),
+            mock.patch.object(bridge_ax.time, "sleep"),
+        ):
+            ok2, r2 = bx.write_prompt_and_submit(999, "Prompt body")
+        self.assertFalse(ok2)
+        self.assertEqual(r2, "send_button_not_found_or_disabled")
+        self.assertEqual(bx.perform_action.call_count, 0)
+
+    def test_step3_barrier_pause_and_slow_ax_cutover(self) -> None:
+        with mock.patch("sys.stdout", new=io.StringIO()):
+            tb.cmd_pair(
+                self.bridge,
+                argparse.Namespace(
+                    pair_cmd="add", id="loc_bar", adapter="local", t3_thread=None,
+                    gemini_title="Gem-Barrier", reply_to=None, label=None, workspace=None,
+                    route="gemini", reply_mode="auto", force=False,
+                ),
+            )
+        self.ax.add_conv("Gem-Barrier")
+
+        # Verify atomic_rename_excl rejects overwriting existing destination
+        existing_dst = self.root / "inbox/existing.task.json"
+        tb.atomic_json(existing_dst, {"keep": True})
+        src_over = self.root / "inbox/._stage.over.task.json"
+        tb.atomic_json(src_over, {"keep": False})
+        try:
+            with self.assertRaises(FileExistsError):
+                tb.atomic_rename_excl(src_over, existing_dst, lock_dir=self.root)
+            self.assertTrue(tb.decode_json(existing_dst.read_bytes())["keep"])
+        finally:
+            existing_dst.unlink()
+            if src_over.exists():
+                src_over.unlink()
+
+        # Threaded P0-A barrier between Stage 2 (ledger reservation) and Stage 3 (atomic_rename_excl)
+        tid = "barrier-p0a-1"
+        msg = "Barrier task"
+        req_sha, _ = tb.sha256_text(msg)
+        stage_name = f"._stage.{tid}.cafebabe.task.json"
+        stage_path = self.root / "inbox" / stage_name
+        inbox_path = self.root / "inbox" / f"{tid}.task.json"
+        stage_ready = threading.Event()
+        release_stage = threading.Event()
+        prod_err: list[BaseException] = []
+
+        with tb.file_lock(self.root / ".pairs.lock"):
+            loc_uid = self.bridge.pairs()["pairs"]["loc_bar"]["pairUid"]
+
+        def producer() -> None:
+            try:
+                raw_env = json.dumps({
+                    "schemaVersion": 2, "taskId": tid, "pairId": "loc_bar", "pairUid": loc_uid,
+                    "adapter": "local", "replyThreadId": None, "replyMode": "auto", "message": msg,
+                }).encode("utf-8")
+                fd = os.open(str(stage_path), os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX)
+                    os.write(fd, raw_env)
+                    os.fsync(fd)
+                    with self.bridge.ledger_tx() as ld:
+                        ld["dispatches"][tid] = {
+                            "status": "queued", "deliveryKind": "gemini_reply", "pairId": "loc_bar",
+                            "pairUid": loc_uid, "adapter": "local", "geminiTitle": "Gem-Barrier",
+                            "replyThreadId": None, "requestSha256": req_sha,
+                            "stagingFile": stage_name, "published": False, "createdAt": tb.now_iso(),
+                        }
+                    stage_ready.set()
+                    release_stage.wait(5.0)
+                    tb.atomic_rename_excl(stage_path, inbox_path, lock_dir=self.root)
+                    with self.bridge.ledger_tx(enforce_intake_cap=False) as ld:
+                        ld["dispatches"][tid]["published"] = True
+                finally:
+                    os.close(fd)
+            except BaseException as exc:
+                prod_err.append(exc)
+                stage_ready.set()
+
+        th = threading.Thread(target=producer, daemon=True)
+        th.start()
+        self.assertTrue(stage_ready.wait(3.0))
+        # While paused at barrier, continuous scan ignores staging and never creates premature inbox file
+        self.bridge.scan(recover=False)
+        self.assertFalse(inbox_path.exists())
+        self.assertTrue(stage_path.exists())
+
+        release_stage.set()
+        th.join(timeout=5.0)
+        self.assertEqual(prod_err, [])
+        self.assertTrue(inbox_path.exists())
+        self.assertFalse(stage_path.exists())
+        self.assertEqual(os.stat(inbox_path).st_nlink, 1)
+
+        # Next scan dispatches cleanly
+        self.bridge.scan(recover=False)
+        self.assertEqual(self.bridge.get_task_status(tid)["status"], "in_flight")
+
+        # P0-1 slow AX submit cutover fence
+        import plistlib
+        old_script = self.tmp / "old_cutover.py"
+        old_script.write_text("#!/usr/bin/python3\n# old v2.0\n", encoding="utf-8")
+        new_script = self.tmp / "new_cutover.py"
+        new_script.write_text('#!/usr/bin/python3\nBRIDGE_VERSION = "2.1.0"\n', encoding="utf-8")
+        plist_file = self.la_dir / "io.test.cutover.plist"
+        plist_file.write_bytes(plistlib.dumps({
+            "Label": "io.test.cutover",
+            "ProgramArguments": ["/usr/bin/python3", str(old_script), "--root", str(self.root), "run"],
+            "EnvironmentVariables": {"T3_GEMINI_BRIDGE_ROOT": str(self.root)},
+            "KeepAlive": True,
+        }))
+        tb.atomic_json(self.root / ".daemon_health.json", {
+            "schemaVersion": 1, "pid": 42424, "startedAt": tb.now_iso(), "lastScanAt": tb.now_iso(),
+            "axTrusted": True, "screenLocked": False, "geminiRunning": True, "geminiPid": 99999,
+            "globalMode": "hybrid", "lastError": None,
+        })
+        with mock.patch("sys.stdout", new=io.StringIO()):
+            tb.cmd_mode(self.bridge, "t3-all")
+        self.assertEqual(self.bridge.config()["global_mode"], "t3_only")
+
+        with tb.file_lock(self.root / ".process.lock", nonblocking=True) as lfd:
+            os.ftruncate(lfd, 0)
+            os.write(lfd, b"42424")
+            with mock.patch.object(tb, "agent_info", return_value={"loaded": True, "pid": 42424, "state": "running"}):
+                ok_before, _ = self.bridge.check_v21_runtime_for_root(self.bridge.config())
+                self.assertFalse(ok_before)
+                # Even once slow scan ends and old daemon emits globalMode="t3_only", gate stays closed while old lock/plist remain
+                tb.atomic_json(self.root / ".daemon_health.json", {
+                    "schemaVersion": 1, "pid": 42424, "startedAt": tb.now_iso(), "lastScanAt": tb.now_iso(),
+                    "axTrusted": True, "screenLocked": False, "geminiRunning": True, "geminiPid": 99999,
+                    "globalMode": "t3_only", "lastError": None,
+                })
+                ok_after_hb, _ = self.bridge.check_v21_runtime_for_root(self.bridge.config())
+                self.assertFalse(ok_after_hb)
+
+        # Controlled bootout + file swap unlocks v2.1
+        plist_file.write_bytes(plistlib.dumps({
+            "Label": "io.test.cutover",
+            "ProgramArguments": ["/usr/bin/python3", str(new_script), "--root", str(self.root), "run"],
+            "EnvironmentVariables": {"T3_GEMINI_BRIDGE_ROOT": str(self.root)},
+        }))
+        tb.atomic_json(self.root / "t3_gemini_bridge.py", {"dummy": 1})  # ensure replaced cleanly next line
+        (self.root / "t3_gemini_bridge.py").write_text('#!/usr/bin/python3\nBRIDGE_VERSION = "2.1.0"\n', encoding="utf-8")
+        with mock.patch.object(tb, "agent_info", return_value={"loaded": False}):
+            ok_final, reason_final = self.bridge.check_v21_runtime_for_root(self.bridge.config())
+            self.assertTrue(ok_final)
+            self.assertEqual(reason_final, "offline_upgraded_root")
+
+    def test_step3_legacy_samples_deferral_and_read_errors(self) -> None:
+        with self.bridge.pairs_tx() as pdata:
+            pdata["pairs"]["t3_leg"] = {
+                "pairId": "t3_leg", "label": "Legacy T3", "t3ThreadId": "thread-leg",
+                "defaultReplyThreadId": "thread-leg", "allowedReplyThreadIds": ["thread-leg"],
+                "geminiTitle": "Gem-Leg-S1", "route": "gemini", "replyMode": "auto", "enabled": True,
+            }
+        self.ax.add_conv("Gem-Leg-S1")
+
+        # Legacy sample 1: queued inbox file without any dispatches entry
+        tid1 = "legacy-no-disp-1"
+        tb.atomic_json(self.root / "inbox" / f"{tid1}.task.json", {
+            "schemaVersion": 2, "taskId": tid1, "pairId": "t3_leg",
+            "replyThreadId": "thread-leg", "replyMode": "auto", "message": "Legacy no snapshot",
+        })
+        self.bridge.scan(recover=False)
+        self.assertEqual(self.bridge.get_task_status(tid1)["status"], "in_flight")
+        with tb.file_lock(self.root / ".ledger.lock"):
+            self.assertIsNone(self.bridge.ledger()["dispatches"][tid1]["pairUid"])
+
+        # Lazy pairUid deferral while active pairUid=None task exists
+        res_def = self.bridge.submit_task(
+            pair_id="t3_leg", message="Defer uid for CLI", task_id="legacy-def-2", forbid_legacy_pair_uid_deferral=False
+        )
+        self.assertIsNone(self.bridge.pairs()["pairs"]["t3_leg"].get("pairUid"))
+        with self.assertRaises(tb.BridgeError) as cm_mcp_def:
+            self.bridge.submit_task(
+                pair_id="t3_leg", message="Reject MCP during active legacy", forbid_legacy_pair_uid_deferral=True
+            )
+        self.assertEqual(str(cm_mcp_def.exception), "pair_has_active_legacy_task_retry_after_drain")
+
+        # Legacy sample 2: minimal v2 outbox without pairUid delivers cleanly
+        tb.atomic_json(self.root / "outbox" / f"{tid1}.json", {
+            "taskId": tid1, "pairId": "t3_leg", "message": "Legacy minimal reply",
+        })
+        self.bridge.scan(recover=False)
+        self.assertEqual(self.bridge.get_task_status(tid1)["status"], "sent")
+        self.assertEqual(len(self._cli_calls()), 1)
+
+        # Deliver queued legacy-def-2 as well
+        self.bridge.scan(recover=False)
+        tb.atomic_json(self.root / "outbox/legacy-def-2.json", {
+            "taskId": "legacy-def-2", "pairId": "t3_leg", "message": "Deferred reply",
+        })
+        self.bridge.scan(recover=False)
+        self.assertEqual(self.bridge.get_task_status("legacy-def-2")["status"], "sent")
+
+        # Legacy sample 3: flat v1 sent/<tid>.json payload + read error distinctions
+        v1_msg = "Flat v1 archived message"
+        v1_sha, v1_bytes = tb.sha256_text(v1_msg)
+        v1_path = self.root / "sent/legacy-v1-3.json"
+        tb.atomic_json(v1_path, {"taskId": "legacy-v1-3", "pairId": "t3_leg", "message": v1_msg})
+        bad_msg = "Original message"
+        bad_sha, bad_bytes = tb.sha256_text(bad_msg)
+        tb.atomic_json(self.root / "sent/payloads/corrupt-4.json", {"taskId": "corrupt-4", "pairId": "t3_leg", "message": "TAMPERED"})
+        with self.bridge.ledger_tx() as ld:
+            ld["tasks"]["legacy-v1-3"] = {"status": "sent", "adapter": "t3", "pairId": "t3_leg", "messageSha256": v1_sha, "messageBytes": v1_bytes}
+            ld["tasks"]["corrupt-4"] = {"status": "sent", "adapter": "t3", "pairId": "t3_leg", "payloadRelPath": "sent/payloads/corrupt-4.json", "messageSha256": bad_sha, "messageBytes": bad_bytes}
+            ld["dispatches"]["dt3-only-5"] = {"status": "direct_t3", "deliveryKind": "direct_t3_forwarded", "pairId": "t3_leg", "adapter": "t3"}
+        self.assertEqual(self.bridge.read_task_payload("legacy-v1-3")["message"], v1_msg)
+
+        v1_path.unlink()
+        with self.assertRaises(tb.BridgeError) as cm_unavail:
+            self.bridge.read_task_payload("legacy-v1-3")
+        self.assertEqual(str(cm_unavail.exception), "historical_payload_unavailable")
+
+        with self.assertRaises(tb.BridgeError) as cm_corrupt:
+            self.bridge.read_task_payload("corrupt-4")
+        self.assertEqual(str(cm_corrupt.exception), "archived_payload_corrupted")
+
+        with self.assertRaises(tb.BridgeError) as cm_dt3:
+            self.bridge.read_task_payload("dt3-only-5")
+        self.assertEqual(str(cm_dt3.exception), "direct_t3_has_no_gemini_reply")
+
+        # pair remove + pair add mints a strictly fresh pairUid
+        with mock.patch("sys.stdout", new=io.StringIO()):
+            tb.cmd_pair(self.bridge, argparse.Namespace(pair_cmd="remove", id="t3_leg", force=True))
+            tb.cmd_pair(
+                self.bridge,
+                argparse.Namespace(
+                    pair_cmd="add", id="t3_leg", adapter="t3", t3_thread="thread-leg",
+                    gemini_title="Gem-Leg-S1", reply_to=None, label=None, workspace=None,
+                    route="gemini", reply_mode="auto", force=False,
+                ),
+            )
+            uid1 = self.bridge.pairs()["pairs"]["t3_leg"]["pairUid"]
+            tb.cmd_pair(self.bridge, argparse.Namespace(pair_cmd="remove", id="t3_leg", force=True))
+            tb.cmd_pair(
+                self.bridge,
+                argparse.Namespace(
+                    pair_cmd="add", id="t3_leg", adapter="t3", t3_thread="thread-leg",
+                    gemini_title="Gem-Leg-S1", reply_to=None, label=None, workspace=None,
+                    route="gemini", reply_mode="auto", force=False,
+                ),
+            )
+            uid2 = self.bridge.pairs()["pairs"]["t3_leg"]["pairUid"]
+        self.assertIsNotNone(uid1)
+        self.assertIsNotNone(uid2)
+        self.assertNotEqual(uid1, uid2)
+
+        # Interleaved direct_t3 commit under caller lock NEVER downgraded to unknown_timeout
+        ilock = self.root / "locks/direct_t3.dt3-inter.lock"
+        fd_il = os.open(str(ilock), os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+        fcntl.flock(fd_il, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        try:
+            with self.bridge.ledger_tx() as ld:
+                ld["dispatches"]["dt3-inter"] = {"status": "direct_t3_sending", "deliveryKind": "direct_t3_forwarded", "pairId": "t3_leg", "pairUid": uid2, "adapter": "t3"}
+            self.assertEqual(self.bridge.get_task_status("dt3-inter")["status"], "direct_t3_sending")
+            with self.bridge.ledger_tx() as ld:
+                ld["dispatches"]["dt3-inter"]["status"] = "direct_t3"
+        finally:
+            os.close(fd_il)
+        self.assertEqual(self.bridge.get_task_status("dt3-inter")["status"], "direct_t3")
+
+    def test_step3_local_clean_reply_wait_exit_codes_and_outbox_card_timeout(self) -> None:
+        with mock.patch("sys.stdout", new=io.StringIO()):
+            tb.cmd_pair(
+                self.bridge,
+                argparse.Namespace(
+                    pair_cmd="add", id="loc_clean", adapter="local", t3_thread=None,
+                    gemini_title="Gem-Clean", reply_to=None, label=None, workspace=None,
+                    route="gemini", reply_mode="auto", force=False,
+                ),
+            )
+            tb.cmd_pair(
+                self.bridge,
+                argparse.Namespace(
+                    pair_cmd="add", id="loc_obx", adapter="local", t3_thread=None,
+                    gemini_title="Gem-OutboxOnly", reply_to=None, label=None, workspace=None,
+                    route="gemini", reply_mode="outbox", force=False,
+                ),
+            )
+        self.ax.add_conv("Gem-Clean")
+        self.ax.add_conv("Gem-OutboxOnly")
+
+        # End-to-end local AX capture produces clean reply without [Bridge Reply: ... -> T3]
+        self.bridge.submit_task(pair_id="loc_clean", message="Clean Q", task_id="clean-1", idempotency_key="ik-clean-1")
+        self.bridge.scan(recover=False)
+        with self.bridge.ledger_tx() as ld:
+            ld["dispatches"]["clean-1"]["dispatchedMono"] = time.monotonic() - 10.0
+        self.ax.current_title = "Gem-Clean"
+        self.ax.conversations["Gem-Clean"]["chunks"].extend(["Pure clean answer", "[[T3_BRIDGE_DONE:clean-1]]"])
+        self.bridge.scan(recover=False)
+        time.sleep(0.25)
+        self.bridge.scan(recover=False)
+        time.sleep(0.55)
+        self.bridge.scan(recover=False)
+        self.bridge.scan(recover=False)
+        self.assertEqual(self.bridge.get_task_status("clean-1")["status"], "sent")
+        clean_msg = self.bridge.read_task_payload("clean-1")["message"]
+        self.assertEqual(clean_msg, "Pure clean answer")
+        self.assertNotIn("[Bridge Reply:", clean_msg)
+
+        # CLI `send --wait` (via idempotency replay) and `task wait/read` exit codes 0 / 1 / 2 / 3
+        with mock.patch("sys.stdout", new=io.StringIO()) as buf_send:
+            rc_send = tb.cmd_send(
+                self.bridge,
+                argparse.Namespace(
+                    pair="loc_clean", message="Clean Q", file=None, stdin=False,
+                    task_id=None, reply_to=None, idempotency_key="ik-clean-1",
+                    wait=True, timeout=1.0, return_on_attention=False,
+                ),
+            )
+        self.assertEqual(rc_send, 0)
+        self.assertEqual(json.loads(buf_send.getvalue())["message"], "Pure clean answer")
+
+        with mock.patch("sys.stdout", new=io.StringIO()):
+            self.assertEqual(tb.cmd_task(self.bridge, argparse.Namespace(task_cmd="read", task_id="clean-1")), 0)
+            self.assertEqual(tb.cmd_task(self.bridge, argparse.Namespace(task_cmd="wait", task_id="clean-1", timeout=0.5, return_on_attention=True)), 0)
+
+            self.bridge.submit_task(pair_id="loc_clean", message="Queued timeout", task_id="q-wait-1")
+            self.assertEqual(tb.cmd_task(self.bridge, argparse.Namespace(task_cmd="wait", task_id="q-wait-1", timeout=0.5, return_on_attention=True)), 1)
+
+            with self.bridge.ledger_tx() as ld:
+                ld["dispatches"]["fail-wait-2"] = {"status": "failed", "pairId": "loc_clean", "adapter": "local", "reason": "boom"}
+                ld["dispatches"]["attn-wait-3"] = {"status": "needs_attention", "pairId": "loc_clean", "adapter": "local", "attentionEpisode": 1}
+            self.assertEqual(tb.cmd_task(self.bridge, argparse.Namespace(task_cmd="wait", task_id="fail-wait-2", timeout=0.5, return_on_attention=True)), 2)
+            self.assertEqual(tb.cmd_task(self.bridge, argparse.Namespace(task_cmd="wait", task_id="attn-wait-3", timeout=0.5, return_on_attention=True)), 3)
+
+        # replyMode="outbox": confirmation card detected & cleared, NO AX scraping, expires to max_task_wait_exceeded_while_needs_attention
+        self.bridge.submit_task(pair_id="loc_obx", message="Outbox mode", task_id="obx-card-1")
+        self.bridge.scan(recover=False)
+        with self.bridge.ledger_tx() as ld:
+            ld["dispatches"]["obx-card-1"]["dispatchedMono"] = time.monotonic() - 10.0
+
+        self.ax.conversations["Gem-OutboxOnly"]["badge"] = "in_progress"
+        self.ax.confirmation_card = "ActionCardRemyConfirmationCard"
+        self.bridge.scan(recover=False)
+        self.assertEqual(self.bridge.get_task_status("obx-card-1")["status"], "needs_attention")
+
+        self.ax.confirmation_card = None
+        self.ax.conversations["Gem-OutboxOnly"]["badge"] = None
+        self.ax.conversations["Gem-OutboxOnly"]["chunks"].extend(["Should never be AX-scraped", "[[T3_BRIDGE_DONE:obx-card-1]]"])
+        self.bridge.scan(recover=False)
+        self.assertEqual(self.bridge.get_task_status("obx-card-1")["status"], "in_flight")
+        time.sleep(0.25)
+        self.bridge.scan(recover=False)
+        time.sleep(0.55)
+        self.bridge.scan(recover=False)
+        self.assertEqual(self.bridge.get_task_status("obx-card-1")["status"], "in_flight")
+        self.assertFalse((self.root / "outbox/obx-card-1.json").exists())
+
+        self.ax.confirmation_card = "ActionCardRemyConfirmationCard"
+        self.bridge.scan(recover=False)
+        self.assertEqual(self.bridge.get_task_status("obx-card-1")["status"], "needs_attention")
+        with self.bridge.ledger_tx() as ld:
+            ld["dispatches"]["obx-card-1"]["dispatchedMono"] = time.monotonic() - 5000.0
+        self.bridge.scan(recover=False)
+        st_obx_to = self.bridge.get_task_status("obx-card-1")
+        self.assertEqual(st_obx_to["status"], "timed_out")
+        self.assertEqual(st_obx_to["reason"], "max_task_wait_exceeded_while_needs_attention")
 
 
 if __name__ == "__main__":

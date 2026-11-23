@@ -1,8 +1,8 @@
 interface:
-  display_name: "T3 <-> Gemini Desktop Bridge"
-  short_description: "1-to-1 automated bridge between T3 Code and Gemini Desktop"
+  display_name: "Gemini Desktop Bridge"
+  short_description: "1-to-1 bridge to Gemini Desktop Task mode for T3 Code, Codex, Claude Code, and Antigravity"
   brand_color: "#2563EB"
-  default_prompt: "Use $t3-gemini-bridge to check bridge health, bind a T3 thread 1-to-1 with a Gemini Desktop Task conversation, or switch routing modes."
+  default_prompt: "Use $t3-gemini-bridge to check bridge health, bind a local or T3 agent session 1-to-1 with a Gemini Desktop Task conversation, or run the stdio MCP server."
 
 policy:
   allow_implicit_invocation: true

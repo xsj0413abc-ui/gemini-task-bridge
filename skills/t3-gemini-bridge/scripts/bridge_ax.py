@@ -1152,22 +1152,27 @@ class MacOSAXBridge:
                 finally:
                     self.cf.CFRelease(ta)
 
-                # Wait up to 1.5s for send button to become enabled
+                # Wait up to 1.5s for send button to become enabled.
+                # Distinguish "never attempted AXPress" from "AXPress invoked with uncertain outcome".
                 sent = False
+                press_attempted = False
                 btn_deadline = time.monotonic() + 1.5
                 while time.monotonic() < btn_deadline:
                     btn = self._find_element(win, self._is_send_button, skip_outline=True, max_depth=14)
                     if btn is not None:
+                        press_attempted = True
                         try:
-                            if self.perform_action(btn, "AXPress") == 0:
-                                sent = True
-                                break
+                            rc_press = int(self.perform_action(btn, "AXPress"))
                         finally:
                             self.cf.CFRelease(btn)
+                        if rc_press == 0:
+                            sent = True
+                            break
+                        return False, "submit_press_uncertain"
                     time.sleep(0.05)
 
                 if not sent:
-                    return False, "send_button_not_found_or_disabled"
+                    return False, ("submit_press_uncertain" if press_attempted else "send_button_not_found_or_disabled")
 
                 # Confirm submission took effect
                 verify_deadline = time.monotonic() + 2.0

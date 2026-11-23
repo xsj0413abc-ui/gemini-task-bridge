@@ -67,3 +67,20 @@ jobs:
             echo "Found hardcoded /Users/ path!"
             exit 1
           fi
+
+  python-39-stdlib-smoke:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.9 (zero third-party packages)
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.9"
+
+      - name: Run pure-stdlib unit and MCP subprocess tests on Python 3.9
+        run: python -B -m unittest discover -s tests -v

@@ -2,58 +2,54 @@
 
 **English** | [简体中文](README.zh-CN.md)
 
-Zero-dependency **1-to-1 automated bidirectional bridge** and **Agent Skill** connecting [T3 Code](https://github.com/pingdotgg/t3code) threads with Google **Gemini Desktop (`Gemini.app`) Task mode** conversations on macOS.
+Zero-dependency **1-to-1 automated bridge**, **CLI task runner**, and **stdio MCP server** connecting **T3 Code**, **Claude Code**, **Codex**, and **Antigravity** with Google **Gemini Desktop (`Gemini.app`) Task mode** conversations on macOS.
 
 ---
 
 ## Why This Exists
 
-- **T3 Code** excels at multi-thread agent orchestration (Claude Code, Codex, Antigravity, etc.), while **Google Gemini Desktop (`Gemini.app`) Task mode** offers native Gemini desktop capabilities, local folder context, and separate usage pools.
-- Neither tool provides an official API to submit prompts directly into an existing Gemini Desktop Task conversation and automatically route results back into a specific T3 Code thread.
-- `t3-gemini-bridge` solves this cleanly using macOS native Accessibility (`AXUIElement`) + the official `t3` CLI—with **zero third-party `pip` dependencies**, **zero clipboard/focus hijacking**, and **instant 1-command rollback to T3-only**.
+- **T3 Code**, **Claude Code**, **Codex**, and **Antigravity** excel at coding, file edits, and agent orchestration, while **Google Gemini Desktop (`Gemini.app`) Task mode** provides native Gemini desktop workflows, local folder context, and separate usage pools.
+- Neither side provides an official API to submit prompts directly into a dedicated Gemini Desktop Task conversation, detect inline confirmation cards safely, and return results automatically.
+- `t3-gemini-bridge` solves this with macOS native Accessibility (`AXUIElement`), atomic local file queues, a zero-dependency stdio MCP server, and optional `t3 thread send` delivery—with **zero third-party `pip` dependencies** and **zero clipboard/focus hijacking**.
 
 ---
 
 ## Key Features
 
-- **Fully Automated Roundtrip (No Manual Wake-Up)**:
-  - **Outbound**: `t3-gemini-bridge send` atomically queues tasks in `inbox/`. A macOS LaunchAgent daemon silently switches `Gemini.app` to the paired conversation, injects the prompt via `AXValue`, and submits via `AXPress`—without touching your clipboard or stealing window focus.
-  - **Inbound**: Supports both structured JSON receipts (`outbox/<taskId>.json`) and automatic AX reply extraction fallback, delivering clean results back into the target T3 thread via `t3 thread send`.
-- **Strict 1-to-1 Isolation & 4-Layer Anti-Crosstalk**:
-  - `pairs.json` forbids two enabled pairs from sharing the same `t3ThreadId` or `geminiTitle`.
-  - Verifies `AXWindow.AXTitle == geminiTitle` before every injection/capture, skips busy/confirmation states (`in_progress`, `needs_attention`, stop button), and serializes dispatches per pair FIFO while running distinct pairs concurrently.
-- **Split-Sentinel Prompt-Echo Immunity**:
-  - Wraps dispatches with `[[T3_BRIDGE_START:<taskId>]]` and split completion instructions so prompt echoes in the AX tree never trigger premature capture, while cleanly isolating new replies across multi-turn conversations.
-- **Instant Rollback to T3-Only (`mode t3-all`)**:
-  - Switch all pairs back to native T3 threads instantly with `t3-gemini-bridge mode t3-all` (or per pair with `pair route <id> t3`). Existing T3 threads and files remain untouched.
+- **Universal Multi-Agent Support (`adapter=local` + `adapter=t3`)**:
+  - **Claude Code / Codex / Antigravity (`local`)**: No `t3` CLI installation required. Dispatch via scoped stdio MCP (`t3-gemini-bridge mcp`) or CLI (`send` / `task status|wait|read`), with SHA-256 verified archival in `sent/payloads/`.
+  - **T3 Code (`t3`)**: Full bidirectional 1-to-1 integration returning replies directly to whitelisted T3 threads via `t3 thread send`, preserving flat `sent/<taskId>.json` + `sent/<taskId>.receipt.json` compatibility and instant `mode t3-all` rollback.
+- **Zero-Dependency Stdio MCP Server (`t3-gemini-bridge mcp`)**:
+  - Pure Python 3.9+ stdlib JSON-RPC 2.0 supporting MCP `2025-06-18`, `2025-03-26` (batch), and `2024-11-05`.
+  - Defaults to `--adapter-filter local` and supports fail-closed `--allow-pairs` isolation so project agents never touch production `t3` pairs.
+  - Non-blocking `gemini_send`, bounded chunked `gemini_wait`, 3-lane concurrency (control frames never queue behind waits), and per-request `notifications/cancelled`.
+- **Crash-Safe Queues & Single-Link Publishing**:
+  - Uses 3-phase hidden staging + `atomic_rename_excl` (`renamex_np` on macOS / `renameat2` on Linux) keeping `st_nlink == 1`, pre-AX `dispatching` intent with Step C re-lock verification, and `28 MiB` / `32 MiB` two-tier ledger capacity protection.
+- **Unified `needs_attention` Detection & Bilingual Support**:
+  - Detects both English and Simplified Chinese (`zh_CN`) `Needs attention` / `需要注意` sidebar badges and inline confirmation cards (`ActionCardRemyConfirmationCard`, etc.), pausing capture/dispatch without auto-approving.
 - **macOS TCC `Python.app` Hardening**:
-  - Automatically avoids Apple's `/usr/bin/python3` ~78-way hardlink shim (which macOS `tccd` frequently misattributes to `/usr/bin/git`), binding the LaunchAgent to a dedicated single-link `Python.app` binary instead.
-- **Bilingual Gemini Desktop UI Support**:
-  - Supports both English and Simplified Chinese (`zh_CN`) `Gemini.app` accessibility labels, badges, confirmation cards, and folder pickers.
+  - Binds LaunchAgent execution to a dedicated single-hardlink `Python.app` binary so macOS `tccd` never misattributes Accessibility trust to `/usr/bin/git`.
 
 ---
 
 ## Architecture
 
 ```text
-T3 Code Thread ──(send)──▶ inbox/*.task.json ──▶ LaunchAgent Daemon (Python 3.9+ stdlib)
-      ▲                                                  │
-      │                                       AXValue + AXPress (silent)
-      │                                                  ▼
-`t3 thread send` ◀── outbox/<taskId>.json ◀──── Gemini.app (Task Mode)
-                     (or AX reply capture)
+T3 Code / Claude Code / Codex / Antigravity
+  │
+  ├──(CLI: send / task)──▶ 3-phase staging + atomic_rename_excl ──▶ inbox/*.task.json
+  └──(MCP: stdio)──────┘                                                   │
+                                                                           ▼
+`t3 thread send` (t3) /                                   LaunchAgent Daemon (Python 3.9+ stdlib)
+`sent/payloads/` (local) ◀── outbox/<taskId>.json ◀────── AXValue + AXPress (silent, Step C re-lock)
+                             (or AX reply capture)        Gemini.app (Task Mode)
 ```
-
-- **No token theft or private DB writes**: Never touches T3's `statev2.sqlite`, internal provider tokens, or Gemini's SwiftData store.
-- **Fail-closed idempotency**: Marks deliveries `sending` before invoking `t3` and transitions interrupted sends to `unknown_timeout` with zero auto-retries; duplicate receipts go to `dedup/`.
 
 ---
 
 ## Installation
 
 ### 1. Install the Agent Skill
-
-Using Vercel's `skills` CLI (works with T3 Code, Claude Code, Codex, Antigravity, Cursor, etc.):
 
 ```bash
 npx skills add xsj0413abc-ui/t3-gemini-bridge
@@ -66,9 +62,9 @@ Or via Claude Code Plugin Marketplace:
 /plugin install t3-gemini-bridge@t3-gemini-bridge
 ```
 
-### 2. Install the macOS Bridge CLI & LaunchAgent
+### 2. Install the macOS Bridge CLI, MCP Server & LaunchAgent
 
-Requirements: **macOS**, **Python 3.9+**, **T3 Code** (`t3` CLI at `~/.t3/bin/t3` or on `PATH`), and **Google Gemini Desktop** (`/Applications/Gemini.app`).
+Requirements: **macOS**, **Python 3.9+**, and **Google Gemini Desktop** (`/Applications/Gemini.app`). (`t3` CLI is optional and only required if you use `adapter=t3` pairs.)
 
 ```bash
 git clone https://github.com/xsj0413abc-ui/t3-gemini-bridge.git
@@ -76,10 +72,10 @@ cd t3-gemini-bridge
 bash skills/t3-gemini-bridge/scripts/install.sh
 ```
 
-`install.sh` prints the resolved single-link `TCC Python` path (a `Python.app` executable):
+`install.sh` prints the resolved single-link `TCC Python` path (`Python.app`):
 
-1. Open **System Settings -> Privacy & Security -> Accessibility** and enable that `Python.app`.
-2. If your paired workspaces live in `~/Desktop`, `~/Documents`, or `~/Downloads`, also enable that `Python.app` in **Full Disk Access**.
+1. Enable that `Python.app` in **System Settings -> Privacy & Security -> Accessibility**.
+2. Enable it in **Full Disk Access** if paired workspaces live in `~/Desktop`, `~/Documents`, or `~/Downloads`.
 3. Install and verify the background LaunchAgent:
 
 ```bash
@@ -87,68 +83,46 @@ t3-gemini-bridge service install
 t3-gemini-bridge doctor --json
 ```
 
-Confirm these 4 health checks pass:
-- `launchAgent.state == "running"`
-- `daemonHealth.axTrusted == true`
-- `daemonHealth.screenLocked == false`
-- `daemonHealth.geminiRunning == true`
-
 ---
 
 ## Quickstart
 
-### Bind a T3 Thread 1-to-1 with a Gemini Task Conversation
+### Option 1: Codex / Claude Code / Antigravity (`adapter=local` + MCP or CLI)
 
-**Create a brand-new Gemini Task chat and attach a workspace:**
+```bash
+# 1. Create a dedicated Gemini Task chat (no T3 thread needed)
+t3-gemini-bridge pair init \
+  --id "reviewer" \
+  --adapter local \
+  --label "Code Reviewer" \
+  --gemini-title "Code Reviewer" \
+  --workspace "/abs/path/to/project"
 
-> Note: Ensure the target workspace folder has been opened/bookmarked at least once in `Gemini.app`'s **Folders** picker.
+# 2. Register the scoped MCP server in Codex or Claude Code
+codex mcp add gemini-bridge -- "$HOME/.local/bin/t3-gemini-bridge" mcp --adapter-filter local --allow-pairs reviewer
+# or:
+claude mcp add --transport stdio gemini-bridge -- "$HOME/.local/bin/t3-gemini-bridge" mcp --adapter-filter local --allow-pairs reviewer
+
+# 3. Or run via CLI task lifecycle
+t3-gemini-bridge send --pair reviewer --message "Review /abs/path/to/spec.md"
+t3-gemini-bridge task wait <taskId> --return-on-attention --json
+t3-gemini-bridge task read <taskId> --json
+```
+
+See [skills/t3-gemini-bridge/references/mcp-and-multi-agent.md](skills/t3-gemini-bridge/references/mcp-and-multi-agent.md) for host-native TOML/JSON configuration templates.
+
+### Option 2: T3 Code 1-to-1 Bidirectional Pair (`adapter=t3`)
 
 ```bash
 t3-gemini-bridge pair init \
-  --id "reviewer" \
-  --label "Code Reviewer" \
+  --id "t3_reviewer" \
   --t3-thread "<target-t3-thread-id>" \
   --reply-to "<orchestrator-t3-thread-id>" \
-  --gemini-title "Code Reviewer" \
+  --gemini-title "T3 Code Reviewer" \
   --workspace "/abs/path/to/project"
-```
 
-**Or bind an existing Gemini Desktop chat:**
-
-```bash
-t3-gemini-bridge pair gemini-chats --json
-t3-gemini-bridge pair add \
-  --id "reviewer" \
-  --t3-thread "<target-t3-thread-id>" \
-  --reply-to "<orchestrator-t3-thread-id>" \
-  --gemini-title "<exact-gemini-title>"
-```
-
-### Dispatch Tasks & Receive Automatic Replies
-
-```bash
-# Async dispatch (returns taskId immediately; reply arrives in --reply-to T3 thread)
-t3-gemini-bridge send --pair reviewer --message "Review /abs/path/to/spec.md and list blockers."
-
-# Dispatch from file or stdin
-t3-gemini-bridge send --pair reviewer --file /abs/path/to/task.md
-
-# Wait synchronously for roundtrip completion
-t3-gemini-bridge send --pair reviewer --wait --timeout 300 --json --message "..."
-```
-
-### Switch Instantly Between Gemini Bridge and T3-Only
-
-```bash
-# Instant global rollback to native T3 threads (zero Gemini interaction)
-t3-gemini-bridge mode t3-all
-
-# Restore hybrid routing
-t3-gemini-bridge mode hybrid
-
-# Switch a single pair independently
-t3-gemini-bridge pair route reviewer t3
-t3-gemini-bridge pair route reviewer gemini
+t3-gemini-bridge send --pair t3_reviewer --message "Inspect /abs/path/to/spec.md"
+t3-gemini-bridge mode t3-all   # Instant rollback to native T3 threads
 ```
 
 ---
@@ -158,17 +132,19 @@ t3-gemini-bridge pair route reviewer gemini
 ```text
 t3-gemini-bridge/
 ├── .claude-plugin/                  # Claude Code plugin & marketplace manifests
-├── .github/workflows/ci.yml         # Cross-OS unit tests, skill & hygiene checks
+├── .github/workflows/ci.yml         # Python 3.12 & pure-stdlib Python 3.9 CI
 ├── skills/t3-gemini-bridge/
-│   ├── SKILL.md                     # Agent Skill instructions (progressive disclosure)
+│   ├── SKILL.md                     # Agent Skill instructions
 │   ├── agents/openai.yaml           # UI metadata & invocation policy
-│   ├── references/                  # CLI schema, TCC guide, architecture & safety docs
+│   ├── references/                  # CLI, MCP/multi-agent, TCC & cutover/safety docs
 │   └── scripts/
 │       ├── bridge_ax.py             # macOS Accessibility & DiagnosticLogWatcher driver
-│       ├── t3_gemini_bridge.py      # Bridge CLI, queue state machine & LaunchAgent manager
-│       └── install.sh               # Non-destructive local installer
+│       ├── mcp_server.py            # Zero-dependency stdlib stdio MCP server
+│       ├── t3_gemini_bridge.py      # Bridge CLI, adapters, queues & LaunchAgent manager
+│       └── install.sh               # Atomic non-destructive local installer
 └── tests/
-    └── test_bridge.py               # 26 offline unit tests (mocked AX & fake t3 CLI)
+    ├── test_bridge.py               # Offline bridge, cutover, crash & ACL unit tests
+    └── test_mcp.py                  # Stdio MCP protocol & concurrency tests
 ```
 
 ---
@@ -184,9 +160,9 @@ python3 -B -m unittest discover -s tests -v
 ## Security & Privacy Design
 
 - Runtime directories are created with `0o700` and state files with `0o600` under `umask 0o077`.
-- Every file read rejects symlinks (`O_NOFOLLOW` + parent `no_symlink()` walk), enforces byte/line caps, verifies `st_nlink == 1`, and rejects files modified mid-read.
-- Outbound `replyThreadId` values are validated against each pair's strict allowlist.
-- No hardcoded user paths, tokens, or account identifiers exist in the codebase.
+- Every file read rejects symlinks (`O_NOFOLLOW` + `no_symlink()`), enforces byte/line caps, verifies `st_nlink == 1`, and rejects files modified mid-read.
+- Outbound receipts are stage-gated and cross-checked against frozen intake snapshots (`pairId`, `pairUid`, `adapter`, `replyThreadId`).
+- MCP defaults to `local` scope with fail-closed `--allow-pairs`, per-request authorization, and zero global sidebar/count leakage.
 
 ---
 
