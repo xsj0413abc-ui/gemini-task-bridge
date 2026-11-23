@@ -376,6 +376,98 @@ class McpServerTests(unittest.TestCase):
             rc, _ = c.close()
             self.assertEqual(rc, 0)
 
+    def test_05_batch_2025_03_26_async_ping_cancel_and_eof(self) -> None:
+        c = McpClient(self.root, ["--allow-pairs", "loc_a"], self.base_env)
+        try:
+            c.send({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-03-26"}})
+            self.assertEqual(c.recv()["result"]["protocolVersion"], "2025-03-26")
+
+            c.send({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "gemini_send", "arguments": {"pair_id": "loc_a", "message": "Async batch item"}}})
+            tid = json.loads(c.recv()["result"]["content"][0]["text"])["taskId"]
+
+            # Launch a 10s batch wait + batch ping on 2025-03-26
+            t0 = time.monotonic()
+            c.send([
+                {"jsonrpc": "2.0", "id": "bw-1", "method": "tools/call", "params": {"name": "gemini_wait", "arguments": {"task_id": tid, "timeout_seconds": 10}}},
+                {"jsonrpc": "2.0", "id": "bp-1", "method": "ping"},
+            ])
+
+            # Independent ping MUST return immediately while batch wait is running
+            c.send({"jsonrpc": "2.0", "id": "solo-ping", "method": "ping"})
+            r_solo = c.recv(timeout=1.0)
+            self.assertEqual(r_solo["id"], "solo-ping")
+            self.assertLess(time.monotonic() - t0, 0.8)
+
+            # Cancel batch wait -> batch emits only bp-1 response promptly
+            c.send({"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"requestId": "bw-1"}})
+            r_batch = c.recv(timeout=2.0)
+            self.assertIsInstance(r_batch, list)
+            self.assertEqual(r_batch, [{"jsonrpc": "2.0", "id": "bp-1", "result": {}}])
+
+            # Second 10s batch wait + immediate EOF shuts down cleanly without hanging 10s
+            c.send([
+                {"jsonrpc": "2.0", "id": "bw-2", "method": "tools/call", "params": {"name": "gemini_wait", "arguments": {"task_id": tid, "timeout_seconds": 10}}},
+            ])
+            time.sleep(0.15)
+            t_close = time.monotonic()
+            rc, _ = c.close(timeout=2.5)
+            self.assertEqual(rc, 0)
+            self.assertLess(time.monotonic() - t_close, 1.5)
+        except Exception:
+            c.close(timeout=2.0)
+            raise
+
+    def test_06_v21_gate_after_startup_and_corrupt_archive_error(self) -> None:
+        # 1. Corrupted archived payload MUST surface error via MCP gemini_wait
+        ctid = "mcp-corrupt-1"
+        tb.atomic_json(self.root / "sent/payloads" / f"{ctid}.json", {
+            "taskId": ctid, "pairId": "loc_a", "pairUid": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "message": "TAMPERED",
+        })
+        with self.bridge.ledger_tx() as ld:
+            ld["tasks"][ctid] = {
+                "status": "sent", "adapter": "local", "pairId": "loc_a",
+                "pairUid": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "payloadRelPath": f"sent/payloads/{ctid}.json",
+                "messageSha256": "0" * 64, "messageBytes": 10,
+            }
+            ld["dispatches"][ctid] = {
+                "status": "completed", "adapter": "local", "pairId": "loc_a",
+                "pairUid": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            }
+
+        # Start MCP client scoped to all adapters (so prod_t3 is allowed) while root is clean v2.1 offline
+        c = McpClient(self.root, ["--adapter-filter", "all", "--allow-pairs", "loc_a,prod_t3"], self.base_env)
+        try:
+            c.send({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18"}})
+            c.recv()
+
+            c.send({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "gemini_wait", "arguments": {"task_id": ctid, "timeout_seconds": 1}}})
+            r_cor = c.recv(timeout=2.0)["result"]
+            self.assertTrue(r_cor["isError"])
+            self.assertIn("archived_payload_corrupted", r_cor["content"][0]["text"])
+
+            # Simulate an old v2.0 daemon taking .process.lock after MCP startup -> gemini_send must NOT slip into v2 compat!
+            tb.atomic_json(self.root / ".daemon_health.json", {
+                "schemaVersion": 1, "pid": 42424, "startedAt": tb.now_iso(), "lastScanAt": tb.now_iso(),
+                "axTrusted": True, "screenLocked": False, "geminiRunning": True, "geminiPid": 99999,
+                "globalMode": "hybrid", "lastError": None,
+            })
+            with tb.file_lock(self.root / ".process.lock", nonblocking=True) as fd:
+                os.ftruncate(fd, 0)
+                os.write(fd, b"42424")
+                c.send({
+                    "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+                    "params": {"name": "gemini_send", "arguments": {"pair_id": "prod_t3", "message": "Must reject legacy compat"}},
+                })
+                r_gate = c.recv(timeout=2.0)["result"]
+                self.assertTrue(r_gate["isError"])
+                self.assertIn("daemon_upgrade_required_for_v21_features", r_gate["content"][0]["text"])
+
+            self.assertEqual(list((self.root / "inbox").glob("*.task.json")), [])
+        finally:
+            rc, _ = c.close()
+            self.assertEqual(rc, 0)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -78,6 +78,11 @@ class McpScope:
                 allow_set.add(tok)
         return cls(adapter_filter=adapter_filter, allow_pairs=allow_set)
 
+    def allowed_adapters(self) -> frozenset[str]:
+        if self.adapter_filter == "all":
+            return frozenset({"local", "t3"})
+        return frozenset({self.adapter_filter})
+
     def adapter_allowed(self, adapter: str) -> bool:
         if self.adapter_filter == "all":
             return adapter in ("local", "t3")
@@ -359,6 +364,9 @@ class McpStdioServer:
         pair = pairs_data["pairs"].get(pair_id)
         if not self.scope.pair_allowed(pair_id, pair):
             return True, {"ok": False, "error": "pair_not_accessible_in_scope"}
+        expected_pair_uid = pair.get("pairUid")
+        expected_adapter = tb.pair_adapter(pair)
+        expected_gemini_title = pair["geminiTitle"]
 
         wait_flag = bool(args.get("wait", False))
         timeout_s = float(args.get("timeout_seconds", 30.0))
@@ -371,6 +379,12 @@ class McpStdioServer:
                 message=args["message"],
                 idempotency_key=idem_key,
                 forbid_legacy_pair_uid_deferral=True,
+                allowed_adapters=self.scope.allowed_adapters(),
+                allow_pairs=self.scope.allow_pairs,
+                expected_pair_uid=expected_pair_uid,
+                expected_adapter=expected_adapter,
+                expected_gemini_title=expected_gemini_title,
+                require_v21_runtime=True,
             )
         except tb.BridgeError as exc:
             return True, {"ok": False, "error": str(exc)}
@@ -519,7 +533,7 @@ class McpStdioServer:
                 cfg = self.bridge.config()
                 pairs_data = self.bridge.pairs()
                 pair = pairs_data["pairs"].get(args["pair_id"])
-                if isinstance(pair, dict) and tb.resolve_effective_route(cfg, pair) == "t3":
+                if isinstance(pair, dict) and self.scope.pair_allowed(args["pair_id"], pair) and tb.resolve_effective_route(cfg, pair) == "t3":
                     return True
             except Exception:
                 pass
@@ -672,51 +686,111 @@ class McpStdioServer:
             sem.release()
             self.send_frame(self._make_error(req_id, -32603, "Internal error"))
 
-    def _run_batch_item_sync(self, msg: Any) -> Any:
-        ok_env, err_obj = self._validate_envelope(msg)
-        if not ok_env:
-            return err_obj
-        method = msg["method"]
-        if "id" not in msg or method in CONTROL_METHODS:
-            has_resp, resp = self._handle_control_or_sync(msg)
-            return resp if has_resp else None
-        req_id = msg["id"]
-        if method != "tools/call":
-            return self._make_error(req_id, -32601, f"Method not found: {method}")
-        try:
-            tool_name, args = self._prepare_tool_call(msg)
-        except JsonRpcError as exc:
-            return self._make_error(req_id, exc.code, exc.message, exc.data)
-        blocking = self._is_blocking_tool(tool_name, args)
-        sem = self.wait_sem if blocking else self.fast_sem
-        if not sem.acquire(blocking=False):
-            err_code = "too_many_concurrent_waits" if blocking else "mcp_server_busy"
-            return {"jsonrpc": "2.0", "id": req_id, "result": self._format_tool_result({"ok": False, "error": err_code}, is_error=True)}
-        cancel_event = threading.Event()
-        req_key = _req_id_key(req_id)
-        with self.state_lock:
-            self.inflight[req_key] = cancel_event
-        try:
-            is_err, payload = self._execute_tool(tool_name, args, cancel_event)
-            if cancel_event.is_set() or self.shutdown_event.is_set():
-                return None
-            return {"jsonrpc": "2.0", "id": req_id, "result": self._format_tool_result(payload, is_error=is_err)}
-        finally:
-            with self.state_lock:
-                self.inflight.pop(req_key, None)
-            sem.release()
-
     def _handle_batch(self, items: list[Any]) -> None:
         if self.negotiated_version != "2025-03-26" or len(items) == 0:
             self.send_frame(self._make_error(None, -32600, "Invalid Request"))
             return
-        responses: list[Any] = []
-        for item in items:
-            resp = self._run_batch_item_sync(item)
-            if resp is not None:
-                responses.append(resp)
-        if responses:
-            self.send_frame(responses)
+
+        batch_lock = threading.Lock()
+        results: list[Any] = [None] * len(items)
+        state: dict[str, Any] = {"remaining": 0, "sealed": False, "sent": False}
+
+        def _take_ready_payload() -> list[Any] | None:
+            if state["sealed"] and state["remaining"] == 0 and not state["sent"]:
+                state["sent"] = True
+                return [r for r in results if r is not None]
+            return None
+
+        for idx, msg in enumerate(items):
+            ok_env, err_obj = self._validate_envelope(msg)
+            if not ok_env:
+                results[idx] = err_obj
+                continue
+            method = msg["method"]
+            if "id" not in msg or method in CONTROL_METHODS:
+                has_resp, resp = self._handle_control_or_sync(msg)
+                results[idx] = resp if has_resp else None
+                continue
+            req_id = msg["id"]
+            if method != "tools/call":
+                results[idx] = self._make_error(req_id, -32601, f"Method not found: {method}")
+                continue
+            try:
+                tool_name, args = self._prepare_tool_call(msg)
+            except JsonRpcError as exc:
+                results[idx] = self._make_error(req_id, exc.code, exc.message, exc.data)
+                continue
+
+            blocking = self._is_blocking_tool(tool_name, args)
+            sem = self.wait_sem if blocking else self.fast_sem
+            pool = self.wait_pool if blocking else self.fast_pool
+            if not sem.acquire(blocking=False):
+                err_code = "too_many_concurrent_waits" if blocking else "mcp_server_busy"
+                results[idx] = {
+                    "jsonrpc": "2.0",
+                    "id": req_id,
+                    "result": self._format_tool_result({"ok": False, "error": err_code}, is_error=True),
+                }
+                continue
+
+            req_key = _req_id_key(req_id)
+            cancel_event = threading.Event()
+            with self.state_lock:
+                self.inflight[req_key] = cancel_event
+            with batch_lock:
+                state["remaining"] += 1
+
+            def _batch_worker(
+                slot: int = idx,
+                rid: Any = req_id,
+                rkey: tuple[str, Any] = req_key,
+                tname: str = tool_name,
+                targs: dict[str, Any] = args,
+                cev: threading.Event = cancel_event,
+                s_sem: threading.BoundedSemaphore = sem,
+            ) -> None:
+                ready_out: list[Any] | None = None
+                try:
+                    is_err, payload = self._execute_tool(tname, targs, cev)
+                    if not cev.is_set() and not self.shutdown_event.is_set():
+                        with batch_lock:
+                            results[slot] = {
+                                "jsonrpc": "2.0",
+                                "id": rid,
+                                "result": self._format_tool_result(payload, is_error=is_err),
+                            }
+                finally:
+                    with self.state_lock:
+                        if self.inflight.get(rkey) is cev:
+                            self.inflight.pop(rkey, None)
+                    s_sem.release()
+                    with batch_lock:
+                        state["remaining"] -= 1
+                        ready_out = _take_ready_payload()
+                if ready_out and not self.shutdown_event.is_set():
+                    self.send_frame(ready_out)
+
+            try:
+                pool.submit(_batch_worker)
+            except Exception:
+                with self.state_lock:
+                    if self.inflight.get(req_key) is cancel_event:
+                        self.inflight.pop(req_key, None)
+                sem.release()
+                ready_out_err: list[Any] | None = None
+                with batch_lock:
+                    results[idx] = self._make_error(req_id, -32603, "Internal error")
+                    state["remaining"] -= 1
+                    ready_out_err = _take_ready_payload()
+                if ready_out_err and not self.shutdown_event.is_set():
+                    self.send_frame(ready_out_err)
+
+        final_out: list[Any] | None = None
+        with batch_lock:
+            state["sealed"] = True
+            final_out = _take_ready_payload()
+        if final_out and not self.shutdown_event.is_set():
+            self.send_frame(final_out)
 
     def serve(self) -> int:
         try:

@@ -803,9 +803,30 @@ def _find_launchagents_for_root(root_resolved: Path) -> list[dict[str, Any]]:
     return matches
 
 
+def _read_file_prefix(path: Path, max_bytes: int = 65536) -> bytes:
+    """Safely read up to max_bytes from a regular single-link non-symlink file."""
+    no_symlink(path)
+    fd = os.open(str(path), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+            raise BridgeError("non_regular_or_hardlinked_file")
+        chunks: list[bytes] = []
+        remaining = max_bytes
+        while remaining > 0:
+            chunk = os.read(fd, min(remaining, 16384))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        return b"".join(chunks)
+    finally:
+        os.close(fd)
+
+
 def _script_bridge_version(script_path: Path) -> tuple[int, ...] | None:
     try:
-        data = read_bytes(script_path, 32768).decode("utf-8", errors="ignore")
+        data = _read_file_prefix(script_path, 65536).decode("utf-8", errors="ignore")
     except Exception:
         return None
     m = re.search(r'^BRIDGE_VERSION\s*=\s*"([0-9]+(?:\.[0-9]+)*)"', data, re.M)
@@ -1519,15 +1540,22 @@ class Bridge:
 
             # Cutpoint (b): already committed `sent` in ledger before unlink(sending)
             if isinstance(prev, dict) and prev.get("status") == "sent":
-                payload_rel = prev.get("payloadRelPath") or self._payload_relpath_for_task(tid, prev.get("adapter") or "t3")
                 receipt_abs = self.root / "sent" / f"{tid}.receipt.json"
-                if (self.root / payload_rel).exists() and receipt_abs.exists():
+                archive_valid = False
+                try:
+                    self.read_task_payload(tid)
+                    rec_check = decode_json(read_bytes(receipt_abs, cfg["max_receipt_file_bytes"]))
+                    if isinstance(rec_check, dict) and rec_check.get("taskId") == tid and rec_check.get("accepted") is True:
+                        archive_valid = True
+                except (BridgeError, OSError):
+                    archive_valid = False
+                if archive_valid:
                     path.unlink()
                     fsync_dir(path.parent)
                     self._archive_in_flight(tid, "inbox/done")
                     pending.discard(tid)
                     continue
-                # If sent payload somehow missing on local/t3 recovery, try hydrating from sending
+                # If archived payload/receipt missing or corrupted, re-hydrate from intact sending/<tid>.json copy
                 try:
                     raw_obj = decode_json(read_bytes(path, cfg["max_receipt_file_bytes"]))
                     msg = raw_obj.get("message") if isinstance(raw_obj, dict) else None
@@ -1553,6 +1581,9 @@ class Bridge:
                         continue
                 except Exception:
                     pass
+                self.move(path, "failed")
+                pending.discard(tid)
+                continue
 
             # Cutpoint (a): outbox -> sending moved, crashed BEFORE tasks[tid] pre-claim written
             if prev is None:
@@ -1781,10 +1812,28 @@ class Bridge:
                 if isinstance(d, dict) and d.get("status") == "queued" and d.get("published") is False
             ]
 
+        def _mark_missing_if_truly_absent(tid: str, stage_path: Path | None, inbox_path: Path) -> None:
+            in_fl_path = self.root / "inbox/in_flight" / f"{tid}.task.json"
+            done_path = self.root / "inbox/done" / f"{tid}.task.json"
+            with self.ledger_tx(enforce_intake_cap=False) as ld:
+                cur = ld["dispatches"].get(tid)
+                if not isinstance(cur, dict) or cur.get("status") != "queued" or cur.get("published") is not False:
+                    return
+                if inbox_path.exists() or in_fl_path.exists() or done_path.exists() or tid in ld["tasks"]:
+                    cur["published"] = True
+                    cur["updatedAt"] = now_iso()
+                    return
+                if stage_path is not None and stage_path.exists():
+                    return
+                cur["status"] = "failed"
+                cur["reason"] = "intake_staging_missing"
+                cur["updatedAt"] = now_iso()
+
         for tid, d in unpublished:
             inbox_path = inbox_dir / f"{tid}.task.json"
-            if inbox_path.exists():
-                with self.ledger_tx() as ld:
+            in_fl_path = self.root / "inbox/in_flight" / f"{tid}.task.json"
+            if inbox_path.exists() or in_fl_path.exists():
+                with self.ledger_tx(enforce_intake_cap=False) as ld:
                     cur = ld["dispatches"].get(tid)
                     if isinstance(cur, dict) and cur.get("status") == "queued" and cur.get("published") is False:
                         cur["published"] = True
@@ -1792,30 +1841,41 @@ class Bridge:
                 continue
             stage_name = d.get("stagingFile")
             if not isinstance(stage_name, str) or not stage_name.startswith("._stage."):
-                with self.ledger_tx() as ld:
-                    cur = ld["dispatches"].get(tid)
-                    if isinstance(cur, dict) and cur.get("status") == "queued" and cur.get("published") is False:
-                        cur["status"] = "failed"
-                        cur["reason"] = "intake_staging_missing"
-                        cur["updatedAt"] = now_iso()
+                _mark_missing_if_truly_absent(tid, None, inbox_path)
                 continue
             stage_path = inbox_dir / stage_name
-            if not stage_path.exists() or stage_path.is_symlink():
-                with self.ledger_tx() as ld:
+            if stage_path.is_symlink():
+                with self.ledger_tx(enforce_intake_cap=False) as ld:
                     cur = ld["dispatches"].get(tid)
                     if isinstance(cur, dict) and cur.get("status") == "queued" and cur.get("published") is False:
                         cur["status"] = "failed"
-                        cur["reason"] = "intake_staging_missing"
+                        cur["reason"] = "intake_staging_corrupted"
                         cur["updatedAt"] = now_iso()
                 continue
-            fd = os.open(str(stage_path), os.O_RDWR | os.O_NOFOLLOW)
+            try:
+                fd = os.open(str(stage_path), os.O_RDWR | os.O_NOFOLLOW)
+            except FileNotFoundError:
+                _mark_missing_if_truly_absent(tid, stage_path, inbox_path)
+                continue
+            except OSError:
+                _mark_missing_if_truly_absent(tid, stage_path, inbox_path)
+                continue
             try:
                 try:
                     fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 except BlockingIOError:
                     continue  # Live producer is still between Step 2 and Step 3
-                if inbox_path.exists():
-                    with self.ledger_tx() as ld:
+                try:
+                    st_fd = os.fstat(fd)
+                    st_path = os.lstat(str(stage_path))
+                except FileNotFoundError:
+                    _mark_missing_if_truly_absent(tid, stage_path, inbox_path)
+                    continue
+                if (st_fd.st_dev, st_fd.st_ino) != (st_path.st_dev, st_path.st_ino):
+                    _mark_missing_if_truly_absent(tid, stage_path, inbox_path)
+                    continue
+                if inbox_path.exists() or in_fl_path.exists():
+                    with self.ledger_tx(enforce_intake_cap=False) as ld:
                         cur = ld["dispatches"].get(tid)
                         if isinstance(cur, dict) and cur.get("status") == "queued":
                             cur["published"] = True
@@ -1831,23 +1891,27 @@ class Bridge:
                     or sha256_text(str(env.get("message") or ""))[0] != d.get("requestSha256")
                 ):
                     self.move(stage_path, "failed")
-                    with self.ledger_tx() as ld:
+                    with self.ledger_tx(enforce_intake_cap=False) as ld:
                         cur = ld["dispatches"].get(tid)
                         if isinstance(cur, dict) and cur.get("status") == "queued":
                             cur["status"] = "failed"
                             cur["reason"] = "intake_staging_corrupted"
                             cur["updatedAt"] = now_iso()
                     continue
-                try:
-                    atomic_rename_excl(stage_path, inbox_path, lock_dir=self.root)
-                except FileExistsError:
-                    pass
-                with self.ledger_tx() as ld:
+                published_here = False
+                with self.ledger_tx(enforce_intake_cap=False) as ld:
                     cur = ld["dispatches"].get(tid)
-                    if isinstance(cur, dict) and cur.get("status") == "queued":
+                    if isinstance(cur, dict) and cur.get("status") == "queued" and cur.get("published") is False:
+                        if not inbox_path.exists() and not in_fl_path.exists():
+                            try:
+                                atomic_rename_excl(stage_path, inbox_path, lock_dir=self.root)
+                                published_here = True
+                            except FileExistsError:
+                                pass
                         cur["published"] = True
                         cur["updatedAt"] = now_iso()
-                self.log("intake_reconciled", tid)
+                if published_here:
+                    self.log("intake_reconciled", tid)
             finally:
                 os.close(fd)
 
@@ -2146,7 +2210,80 @@ class Bridge:
                 updatedAt=now_iso(),
             )
 
+    def reconcile_legacy_in_flight(self, cfg: dict[str, Any]) -> None:
+        """Persist complete dispatch metadata for legacy v2.0 in_flight envelopes before outbox or timeout handling."""
+        in_flight_files = sorted((self.root / "inbox/in_flight").glob("*.task.json"))
+        if not in_flight_files:
+            return
+        now_mono = time.monotonic()
+        with file_lock(self.root / ".pairs.lock"):
+            pairs_data = self.pairs()
+            with file_lock(self.root / ".ledger.lock"):
+                ledger_snap = self.ledger()
+
+        for path in in_flight_files:
+            if path.name.startswith((".", "_")) or path.is_symlink():
+                continue
+            try:
+                task = decode_json(read_bytes(path, cfg["max_inbox_bytes"]))
+            except Exception:
+                self.move(path, "failed")
+                continue
+            if not isinstance(task, dict):
+                self.move(path, "failed")
+                continue
+            tid = task.get("taskId")
+            if not isinstance(tid, str) or not TASK_ID_RE.fullmatch(tid) or path.name != f"{tid}.task.json":
+                self.move(path, "failed")
+                continue
+            t_rec = ledger_snap["tasks"].get(tid)
+            if isinstance(t_rec, dict) and t_rec.get("status") == "sent":
+                continue
+            existing = ledger_snap["dispatches"].get(tid)
+            if isinstance(existing, dict) and "status" in existing and "pairId" in existing:
+                continue
+
+            pid_name = task.get("pairId")
+            pair = pairs_data["pairs"].get(pid_name) if isinstance(pid_name, str) else None
+            if not pair or not pair.get("enabled", True) or pair_adapter(pair) != "t3":
+                self.move(path, "failed")
+                self.log("legacy_in_flight_rejected", tid, "unknown_disabled_or_non_t3_pair")
+                continue
+            reply_tid = task.get("replyThreadId") or pair.get("defaultReplyThreadId")
+            if (
+                not isinstance(reply_tid, str)
+                or not THREAD_ID_RE.fullmatch(reply_tid)
+                or reply_tid not in _allowed_reply_targets_for_pair(pair, pairs_data)
+            ):
+                self.move(path, "failed")
+                self.log("legacy_in_flight_rejected", tid, "unauthorized_reply_target")
+                continue
+
+            prev_mono = existing.get("dispatchedMono") if isinstance(existing, dict) else None
+            mono_eff = prev_mono if isinstance(prev_mono, (int, float)) and prev_mono <= now_mono else now_mono
+            with self.ledger_tx(enforce_intake_cap=False) as ld:
+                cur_d = ld["dispatches"].get(tid)
+                if not isinstance(cur_d, dict) or "status" not in cur_d or "pairId" not in cur_d:
+                    ld["dispatches"][tid] = {
+                        "status": "in_flight",
+                        "deliveryKind": "gemini_reply",
+                        "pairId": pid_name,
+                        "pairUid": None,
+                        "adapter": "t3",
+                        "sourceT3ThreadId": pair["t3ThreadId"],
+                        "geminiTitle": pair["geminiTitle"],
+                        "replyThreadId": reply_tid,
+                        "replyMode": task.get("replyMode") or pair.get("replyMode", "auto"),
+                        "dispatchedMono": mono_eff,
+                        "createdAt": task.get("createdAt") or now_iso(),
+                        "updatedAt": now_iso(),
+                        "baselineTextLen": 0,
+                        "baselineChunks": [],
+                    }
+                    self.log("legacy_in_flight_hydrated", tid, pairId=pid_name)
+
     def process_in_flight(self, cfg: dict[str, Any], probes: dict[str, Any]) -> None:
+        self.reconcile_legacy_in_flight(cfg)
         in_flight_files = sorted((self.root / "inbox/in_flight").glob("*.task.json"))
         if not in_flight_files:
             return
@@ -2199,7 +2336,9 @@ class Bridge:
             # Also handle daemon restarts where dispatchedMono wasn't from current boot
             if not isinstance(disp_mono, (int, float)) or disp_mono > now_mono:
                 with self.ledger_tx() as ld:
-                    ld["dispatches"].setdefault(tid, {})["dispatchedMono"] = now_mono
+                    cur_d = ld["dispatches"].get(tid)
+                    if isinstance(cur_d, dict) and "status" in cur_d and "pairId" in cur_d:
+                        cur_d["dispatchedMono"] = now_mono
                 disp_mono = now_mono
             if (now_mono - disp_mono) > cfg["max_task_wait_seconds"]:
                 reason = (
@@ -2568,7 +2707,7 @@ class Bridge:
                         raise BridgeError("dispatch_state_raced")
                     rec = ld["dispatches"].setdefault(tid, {
                         "pairId": pid_name,
-                        "pairUid": pair.get("pairUid"),
+                        "pairUid": None,  # Legacy unreserved v2.0 envelope must never inherit a newer pairUid
                         "adapter": adapter_name,
                         "deliveryKind": "gemini_reply",
                         "sourceT3ThreadId": pair.get("t3ThreadId") if adapter_name == "t3" else None,
@@ -2700,6 +2839,7 @@ class Bridge:
         else:
             self.reconcile_staged_intake(cfg)
             self.reconcile_direct_t3(cfg)
+        self.reconcile_legacy_in_flight(cfg)
         self.process_outbox(cfg)
         self.process_in_flight(cfg, probes)
         self.process_outbox(cfg)
@@ -2754,6 +2894,33 @@ class Bridge:
         )
         return any(p.exists() or p.is_symlink() for p in candidates)
 
+    def _has_unregistered_queue_tasks_for_pair(self, pair_id: str, ld_snap: dict[str, Any]) -> bool:
+        """Return True if any queued/in_flight envelope for pair_id lacks a ledger snapshot or holds pairUid=None."""
+        dispatches = ld_snap.get("dispatches") or {}
+        for folder in ("inbox", "inbox/in_flight"):
+            for p in (self.root / folder).glob("*.task.json"):
+                if p.name.startswith((".", "_")) or p.is_symlink():
+                    continue
+                try:
+                    env = decode_json(read_bytes(p, 524288))
+                except Exception:
+                    continue
+                if not isinstance(env, dict) or env.get("pairId") != pair_id:
+                    continue
+                etid = env.get("taskId")
+                if not isinstance(etid, str):
+                    continue
+                d_rec = dispatches.get(etid)
+                if d_rec is None:
+                    return True
+                if (
+                    isinstance(d_rec, dict)
+                    and d_rec.get("pairUid") is None
+                    and d_rec.get("status") in ACTIVE_DISPATCH_STATUSES
+                ):
+                    return True
+        return False
+
     def submit_task(
         self,
         *,
@@ -2763,15 +2930,17 @@ class Bridge:
         reply_to: str | None = None,
         idempotency_key: str | None = None,
         forbid_legacy_pair_uid_deferral: bool = False,
+        allowed_adapters: set[str] | frozenset[str] | None = None,
+        allow_pairs: set[str] | frozenset[str] | None = None,
+        expected_pair_uid: str | None = None,
+        expected_adapter: str | None = None,
+        expected_gemini_title: str | None = None,
+        require_v21_runtime: bool = False,
     ) -> dict[str, Any]:
         if not isinstance(pair_id, str) or not PAIR_ID_RE.fullmatch(pair_id):
             raise BridgeError("invalid_pair_id")
         if not message or not message.strip() or "\x00" in message:
             raise BridgeError("invalid_message")
-
-        cfg = self.config()
-        if len(message.encode("utf-8")) > cfg["max_message_bytes"] or len(message.splitlines()) > cfg["max_message_lines"]:
-            raise BridgeError("message_limit_exceeded")
 
         if task_id is not None:
             if not TASK_ID_RE.fullmatch(task_id):
@@ -2782,7 +2951,6 @@ class Bridge:
             raise BridgeError("invalid_idempotency_key")
 
         req_sha256, _ = sha256_text(message)
-        v21_ok, gate_reason = self.check_v21_runtime_for_root(cfg)
 
         stage_path: Path | None = None
         stage_fd: int | None = None
@@ -2796,16 +2964,36 @@ class Bridge:
         pair_uid: str | None = None
         pair_copy: dict[str, Any] = {}
         replay_tid: str | None = None
+        v21_ok = False
 
         try:
             with file_lock(self.root / ".pairs.lock"):
+                cfg = self.config()
+                if len(message.encode("utf-8")) > cfg["max_message_bytes"] or len(message.splitlines()) > cfg["max_message_lines"]:
+                    raise BridgeError("message_limit_exceeded")
+                v21_ok, gate_reason = self.check_v21_runtime_for_root(cfg)
+                if require_v21_runtime and not v21_ok:
+                    raise BridgeError(gate_reason)
+
                 pairs_data = self.pairs()
+                scoped = (allowed_adapters is not None or allow_pairs is not None)
+                if allow_pairs is not None and pair_id not in allow_pairs:
+                    raise BridgeError("pair_not_accessible_in_scope")
                 if pair_id not in pairs_data["pairs"]:
-                    raise BridgeError("unknown_pair_id")
+                    raise BridgeError("pair_not_accessible_in_scope" if scoped else "unknown_pair_id")
                 pair = pairs_data["pairs"][pair_id]
                 if not pair.get("enabled", True):
-                    raise BridgeError("pair_disabled")
+                    raise BridgeError("pair_not_accessible_in_scope" if scoped else "pair_disabled")
                 adapter_name = pair_adapter(pair)
+                if allowed_adapters is not None and adapter_name not in allowed_adapters:
+                    raise BridgeError("pair_not_accessible_in_scope")
+                if expected_adapter is not None and adapter_name != expected_adapter:
+                    raise BridgeError("pair_not_accessible_in_scope")
+                if expected_pair_uid is not None and pair.get("pairUid") != expected_pair_uid:
+                    raise BridgeError("pair_not_accessible_in_scope")
+                if expected_gemini_title is not None and pair.get("geminiTitle") != expected_gemini_title:
+                    raise BridgeError("pair_not_accessible_in_scope")
+
                 effective = resolve_effective_route(cfg, pair)
                 if effective == "paused":
                     raise BridgeError("gemini_routing_paused_by_global_mode")
@@ -2838,7 +3026,7 @@ class Bridge:
                             and d.get("pairUid") is None
                             and d.get("status") in ACTIVE_DISPATCH_STATUSES
                             for d in ld_chk["dispatches"].values()
-                        )
+                        ) or self._has_unregistered_queue_tasks_for_pair(pair_id, ld_chk)
                     if has_active_legacy:
                         if forbid_legacy_pair_uid_deferral:
                             raise BridgeError("pair_has_active_legacy_task_retry_after_drain")
@@ -3014,19 +3202,24 @@ class Bridge:
                     **res,
                 }
 
-            # Stage 3: atomic single-link non-overwriting publish
+            # Stage 3: serialize final publish + published=True against reconcile_staged_intake
             inbox_path = self.root / "inbox" / f"{tid}.task.json"
             assert stage_path is not None
-            try:
-                atomic_rename_excl(stage_path, inbox_path, lock_dir=self.root)
-            except FileExistsError:
-                raise BridgeError("duplicate_task_id") from None
             if v21_ok:
                 with self.ledger_tx(enforce_intake_cap=False) as ld:
+                    try:
+                        atomic_rename_excl(stage_path, inbox_path, lock_dir=self.root)
+                    except FileExistsError:
+                        raise BridgeError("duplicate_task_id") from None
                     cur = ld["dispatches"].get(tid)
                     if isinstance(cur, dict) and cur.get("status") == "queued":
                         cur["published"] = True
                         cur["updatedAt"] = now_iso()
+            else:
+                try:
+                    atomic_rename_excl(stage_path, inbox_path, lock_dir=self.root)
+                except FileExistsError:
+                    raise BridgeError("duplicate_task_id") from None
             self.log("queued_for_gemini", tid, pairId=pair_id, adapter=adapter_name)
             return {
                 "ok": True,
@@ -3079,8 +3272,7 @@ class Bridge:
             candidates.append(self.root / rel)
         else:
             candidates.append(self.root / "sent/payloads" / f"{task_id}.json")
-            if not is_reserved_task_id(task_id):
-                candidates.append(self.root / "sent" / f"{task_id}.json")
+            candidates.append(self.root / "sent" / f"{task_id}.json")
 
         target_path: Path | None = None
         for cand in candidates:
@@ -3282,7 +3474,32 @@ class Bridge:
                     payload_msg = p["message"]
                 except BridgeError as exc:
                     payload_err = str(exc)
-                out: dict[str, Any] = {
+                if payload_err is not None:
+                    with file_lock(self.root / ".ledger.lock"):
+                        t_rec_snap = dict(self.ledger()["tasks"].get(task_id) or {})
+                    if payload_err == "historical_payload_unavailable" and t_rec_snap.get("payloadRelPath") is None:
+                        return 0, {
+                            "ok": True,
+                            "completed": True,
+                            "routed": "gemini",
+                            "taskId": task_id,
+                            "pairId": st.get("pairId"),
+                            "status": "sent",
+                            "message": None,
+                            "receipt": st.get("receipt"),
+                            "payloadStatus": payload_err,
+                        }
+                    return 2, {
+                        "ok": False,
+                        "completed": True,
+                        "routed": "gemini",
+                        "taskId": task_id,
+                        "pairId": st.get("pairId"),
+                        "status": "sent",
+                        "error": payload_err,
+                        "reason": payload_err,
+                    }
+                return 0, {
                     "ok": True,
                     "completed": True,
                     "routed": "gemini",
@@ -3292,9 +3509,6 @@ class Bridge:
                     "message": payload_msg,
                     "receipt": st.get("receipt"),
                 }
-                if payload_err is not None:
-                    out["payloadStatus"] = payload_err
-                return 0, out
 
             if cur == "direct_t3":
                 return 0, {

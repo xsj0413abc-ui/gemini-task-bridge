@@ -1616,6 +1616,338 @@ class BridgePhase1Tests(unittest.TestCase):
         self.assertEqual(st_obx_to["status"], "timed_out")
         self.assertEqual(st_obx_to["reason"], "max_task_wait_exceeded_while_needs_attention")
 
+    def test_review_f1_in_lock_scope_binding_and_v21_gate(self) -> None:
+        with mock.patch("sys.stdout", new=io.StringIO()):
+            tb.cmd_pair(
+                self.bridge,
+                argparse.Namespace(
+                    pair_cmd="add", id="loc_f1", adapter="local", t3_thread=None,
+                    gemini_title="Gem-F1", reply_to=None, label=None, workspace=None,
+                    route="gemini", reply_mode="auto", force=False,
+                ),
+            )
+            tb.cmd_pair(
+                self.bridge,
+                argparse.Namespace(
+                    pair_cmd="add", id="t3_f1", adapter="t3", t3_thread="thread-f1",
+                    gemini_title="Gem-T3-F1", reply_to=None, label=None, workspace=None,
+                    route="gemini", reply_mode="auto", force=False,
+                ),
+            )
+        loc_uid = self.bridge.pairs()["pairs"]["loc_f1"]["pairUid"]
+
+        # Simulate concurrent rebind local -> t3 occurring right before submit_task reads pairs() under .pairs.lock
+        orig_pairs = self.bridge.pairs
+
+        def rebind_on_read() -> dict:
+            pdata = orig_pairs()
+            pdata["pairs"]["loc_f1"] = {
+                "pairId": "loc_f1", "pairUid": loc_uid, "adapter": "t3", "label": "loc_f1",
+                "t3ThreadId": "thread-hijack", "defaultReplyThreadId": "thread-hijack",
+                "allowedReplyThreadIds": ["thread-hijack"], "geminiTitle": "Gem-F1",
+                "route": "t3", "replyMode": "auto", "enabled": True,
+            }
+            tb.atomic_json(self.root / "pairs.json", pdata)
+            return orig_pairs()
+
+        with mock.patch.object(self.bridge, "pairs", side_effect=rebind_on_read):
+            with self.assertRaises(tb.BridgeError) as cm:
+                self.bridge.submit_task(
+                    pair_id="loc_f1", message="Must fail inside lock",
+                    allowed_adapters={"local"}, allow_pairs={"loc_f1"},
+                    expected_pair_uid=loc_uid, expected_adapter="local",
+                    expected_gemini_title="Gem-F1", require_v21_runtime=True,
+                )
+            self.assertEqual(str(cm.exception), "pair_not_accessible_in_scope")
+        self.assertEqual(self._cli_calls(), [])
+        self.assertEqual(list((self.root / "inbox").glob("*.task.json")), [])
+
+        # Also reject stale pairUid or changed geminiTitle inside lock
+        t3_uid = self.bridge.pairs()["pairs"]["t3_f1"]["pairUid"]
+        with self.assertRaises(tb.BridgeError) as cm_uid:
+            self.bridge.submit_task(
+                pair_id="t3_f1", message="Bad uid",
+                allowed_adapters={"t3"}, expected_pair_uid="f" * 32, require_v21_runtime=True,
+            )
+        self.assertEqual(str(cm_uid.exception), "pair_not_accessible_in_scope")
+        self.assertNotEqual(t3_uid, "f" * 32)
+
+        # Require v2.1 runtime rejects sliding into v2.0 compat when old daemon holds .process.lock
+        tb.atomic_json(self.root / ".daemon_health.json", {
+            "schemaVersion": 1, "pid": 42424, "startedAt": tb.now_iso(), "lastScanAt": tb.now_iso(),
+            "axTrusted": True, "screenLocked": False, "geminiRunning": True, "geminiPid": 99999,
+            "globalMode": "hybrid", "lastError": None,
+        })
+        with tb.file_lock(self.root / ".process.lock", nonblocking=True) as fd:
+            os.ftruncate(fd, 0)
+            os.write(fd, b"42424")
+            with self.assertRaises(tb.BridgeError) as cm_gate:
+                self.bridge.submit_task(
+                    pair_id="t3_f1", message="Reject compat",
+                    allowed_adapters={"t3"}, require_v21_runtime=True,
+                )
+            self.assertEqual(str(cm_gate.exception), "daemon_upgrade_required_for_v21_features")
+        self.assertEqual(list((self.root / "inbox").glob("*.task.json")), [])
+
+    def test_review_f2_publish_reconcile_interleave_never_marks_missing(self) -> None:
+        with mock.patch("sys.stdout", new=io.StringIO()):
+            tb.cmd_pair(
+                self.bridge,
+                argparse.Namespace(
+                    pair_cmd="add", id="loc_f2", adapter="local", t3_thread=None,
+                    gemini_title="Gem-F2", reply_to=None, label=None, workspace=None,
+                    route="gemini", reply_mode="auto", force=False,
+                ),
+            )
+        self.ax.add_conv("Gem-F2")
+        loc_uid = self.bridge.pairs()["pairs"]["loc_f2"]["pairUid"]
+
+        tid = "f2-race-1"
+        msg = "Interleaved stage3 rename"
+        req_sha, _ = tb.sha256_text(msg)
+        stage_name = f"._stage.{tid}.12345678.task.json"
+        stage_path = self.root / "inbox" / stage_name
+        inbox_path = self.root / "inbox" / f"{tid}.task.json"
+        tb.atomic_json(stage_path, {
+            "schemaVersion": 2, "taskId": tid, "pairId": "loc_f2", "pairUid": loc_uid,
+            "adapter": "local", "replyThreadId": None, "replyMode": "auto", "message": msg, "createdAt": tb.now_iso(),
+        })
+        with self.bridge.ledger_tx() as ld:
+            ld["dispatches"][tid] = {
+                "status": "queued", "deliveryKind": "gemini_reply", "pairId": "loc_f2",
+                "pairUid": loc_uid, "adapter": "local", "geminiTitle": "Gem-F2",
+                "replyThreadId": None, "requestSha256": req_sha,
+                "stagingFile": stage_name, "published": False, "createdAt": tb.now_iso(),
+            }
+
+        # Race producer atomic_rename_excl RIGHT WHEN reconcile_staged_intake calls os.open(stage_path) -> triggers ENOENT!
+        orig_os_open = tb.os.open
+        raced = [False]
+
+        def race_os_open(path_str: str, flags: int, *args, **kwargs):
+            if not raced[0] and path_str == str(stage_path):
+                raced[0] = True
+                tb.atomic_rename_excl(stage_path, inbox_path, lock_dir=self.root)
+            return orig_os_open(path_str, flags, *args, **kwargs)
+
+        with mock.patch.object(tb.os, "open", side_effect=race_os_open):
+            self.bridge.reconcile_staged_intake(self.bridge.config())
+
+        self.assertTrue(raced[0])
+        self.assertTrue(inbox_path.exists())
+        self.assertEqual(os.stat(inbox_path).st_nlink, 1)
+        with tb.file_lock(self.root / ".ledger.lock"):
+            d_rec = self.bridge.ledger()["dispatches"][tid]
+        self.assertEqual(d_rec["status"], "queued")
+        self.assertTrue(d_rec["published"])
+
+        self.bridge.scan(recover=False)
+        self.assertEqual(self.bridge.get_task_status(tid)["status"], "in_flight")
+
+    def test_review_f3_legacy_in_flight_without_dispatch_delivers_reply(self) -> None:
+        with self.bridge.pairs_tx() as pdata:
+            pdata["pairs"]["t3_f3"] = {
+                "pairId": "t3_f3", "label": "Legacy F3", "t3ThreadId": "thread-A",
+                "defaultReplyThreadId": "thread-B", "allowedReplyThreadIds": ["thread-A", "thread-B"],
+                "geminiTitle": "Gem-F3", "route": "gemini", "replyMode": "auto", "enabled": True,
+            }
+        self.ax.add_conv("Gem-F3")
+
+        tid = "leg-inflight-3"
+        tb.atomic_json(self.root / "inbox/in_flight" / f"{tid}.task.json", {
+            "schemaVersion": 2, "taskId": tid, "pairId": "t3_f3",
+            "replyThreadId": "thread-B", "replyMode": "auto", "message": "In-flight without ledger",
+        })
+        # Run scan BEFORE outbox arrives -> hydrates COMPLETE dispatch instead of hollow dispatchedMono
+        self.bridge.scan(recover=False)
+        with tb.file_lock(self.root / ".ledger.lock"):
+            d_rec = self.bridge.ledger()["dispatches"].get(tid)
+        self.assertIsNotNone(d_rec)
+        self.assertEqual(d_rec["status"], "in_flight")
+        self.assertEqual(d_rec["pairId"], "t3_f3")
+        self.assertIsNone(d_rec["pairUid"])
+        self.assertEqual(d_rec["replyThreadId"], "thread-B")
+
+        # Valid legacy v2 outbox arrives -> delivered to thread-B cleanly, 0 failed files!
+        tb.atomic_json(self.root / "outbox" / f"{tid}.json", {
+            "taskId": tid, "pairId": "t3_f3", "message": "Legacy in_flight answer",
+        })
+        self.bridge.scan(recover=False)
+        self.assertEqual(list((self.root / "failed").iterdir()), [])
+        self.assertEqual(self.bridge.get_task_status(tid)["status"], "sent")
+        calls = self._cli_calls()
+        self.assertEqual(len(calls), 1)
+        self.assertIn("thread-B", calls[0]["args"])
+
+    def test_review_f4_legacy_queued_envelope_never_gains_pair_uid(self) -> None:
+        with self.bridge.pairs_tx() as pdata:
+            pdata["pairs"]["t3_f4"] = {
+                "pairId": "t3_f4", "label": "Legacy F4", "t3ThreadId": "thread-f4",
+                "defaultReplyThreadId": "thread-f4", "allowedReplyThreadIds": ["thread-f4"],
+                "geminiTitle": "Gem-F4", "route": "gemini", "replyMode": "auto", "enabled": True,
+            }
+        self.ax.add_conv("Gem-F4")
+
+        # 1. Unregistered v2.0 queued envelope arrives FIRST (no ledger entry)
+        old_tid = "001-old-queued-4"
+        tb.atomic_json(self.root / "inbox" / f"{old_tid}.task.json", {
+            "schemaVersion": 2, "taskId": old_tid, "pairId": "t3_f4",
+            "replyThreadId": "thread-f4", "replyMode": "auto", "message": "Legacy queued first",
+        })
+
+        # 2. New CLI task arrives SECOND -> lazy pairUid MUST stay None! And MCP rejects until drained.
+        res_cli = self.bridge.submit_task(
+            pair_id="t3_f4", message="CLI after legacy queued", task_id="002-cli-after-4", forbid_legacy_pair_uid_deferral=False
+        )
+        self.assertIsNone(self.bridge.pairs()["pairs"]["t3_f4"].get("pairUid"))
+        self.assertIsNone(res_cli["pairUid"])
+        with self.assertRaises(tb.BridgeError) as cm_mcp:
+            self.bridge.submit_task(
+                pair_id="t3_f4", message="MCP must wait", forbid_legacy_pair_uid_deferral=True
+            )
+        self.assertEqual(str(cm_mcp.exception), "pair_has_active_legacy_task_retry_after_drain")
+
+        # 3. Daemon consumes 001-old-queued-4 first -> pairUid stays None on its dispatch record
+        self.bridge.scan(recover=False)
+        with tb.file_lock(self.root / ".ledger.lock"):
+            self.assertIsNone(self.bridge.ledger()["dispatches"][old_tid]["pairUid"])
+
+        # Complete both active tasks so pair drains cleanly
+        for tid_done in (old_tid, "002-cli-after-4"):
+            self.bridge.scan(recover=False)
+            tb.atomic_json(self.root / "outbox" / f"{tid_done}.json", {
+                "taskId": tid_done, "pairId": "t3_f4", "message": f"Done {tid_done}",
+            })
+            self.bridge.scan(recover=False)
+
+        # 4. Now submit new v2.1 task (mints pairUid), then drop a late unreserved legacy envelope -> MUST STILL get pairUid=None!
+        res_new = self.bridge.submit_task(pair_id="t3_f4", message="Mint UID now", task_id="mint-4")
+        self.assertIsNotNone(res_new["pairUid"])
+        self.bridge.scan(recover=False)
+        tb.atomic_json(self.root / "outbox/mint-4.json", {"taskId": "mint-4", "pairId": "t3_f4", "message": "Done mint-4"})
+        self.bridge.scan(recover=False)
+
+        late_tid = "late-legacy-4"
+        tb.atomic_json(self.root / "inbox" / f"{late_tid}.task.json", {
+            "schemaVersion": 2, "taskId": late_tid, "pairId": "t3_f4",
+            "replyThreadId": "thread-f4", "replyMode": "auto", "message": "Late legacy envelope",
+        })
+        self.bridge.scan(recover=False)
+        with tb.file_lock(self.root / ".ledger.lock"):
+            self.assertIsNone(self.bridge.ledger()["dispatches"][late_tid]["pairUid"])
+
+    def test_review_f5_offline_gate_accepts_real_v21_script_and_rejects_large_v20(self) -> None:
+        import plistlib
+        real_src = SCRIPTS_DIR / "t3_gemini_bridge.py"
+        installed_dst = self.root / "t3_gemini_bridge.py"
+        shutil.copy2(real_src, installed_dst)
+        self.assertGreater(installed_dst.stat().st_size, 100_000)
+
+        plist_file = self.la_dir / "io.test.realscript.plist"
+        plist_file.write_bytes(plistlib.dumps({
+            "Label": "io.test.realscript",
+            "ProgramArguments": ["/usr/bin/python3", str(installed_dst), "--root", str(self.root), "run"],
+            "EnvironmentVariables": {"T3_GEMINI_BRIDGE_ROOT": str(self.root)},
+            "KeepAlive": True,
+        }))
+
+        self.assertEqual(tb._script_bridge_version(installed_dst), (2, 1, 0))
+        with mock.patch.object(tb, "agent_info", return_value={"loaded": False}):
+            ok_v21, reason_v21 = self.bridge.check_v21_runtime_for_root(self.bridge.config())
+            self.assertTrue(ok_v21)
+            self.assertEqual(reason_v21, "offline_upgraded_root")
+
+        # Large >100 KiB script WITHOUT BRIDGE_VERSION parses as (2, 0, 0) and is rejected!
+        v20_dir = self.tmp / "v20_dir"
+        v20_dir.mkdir(parents=True)
+        large_v20 = v20_dir / "t3_gemini_bridge.py"
+        large_v20.write_text("#!/usr/bin/python3\n" + ("# v2.0 padding line\n" * 6000), encoding="utf-8")
+        self.assertGreater(large_v20.stat().st_size, 100_000)
+        plist_file.write_bytes(plistlib.dumps({
+            "Label": "io.test.realscript",
+            "ProgramArguments": ["/usr/bin/python3", str(large_v20), "--root", str(self.root), "run"],
+            "EnvironmentVariables": {"T3_GEMINI_BRIDGE_ROOT": str(self.root)},
+            "KeepAlive": True,
+        }))
+        self.assertEqual(tb._script_bridge_version(large_v20), (2, 0, 0))
+        with mock.patch.object(tb, "agent_info", return_value={"loaded": False}):
+            ok_v20, reason_v20 = self.bridge.check_v21_runtime_for_root(self.bridge.config())
+            self.assertFalse(ok_v20)
+            self.assertEqual(reason_v20, "daemon_upgrade_required_for_v21_features")
+
+    def test_review_f7_and_f8_legacy_receipt_readback_corrupt_wait_and_sending_hydration(self) -> None:
+        with mock.patch("sys.stdout", new=io.StringIO()):
+            tb.cmd_pair(
+                self.bridge,
+                argparse.Namespace(
+                    pair_cmd="add", id="loc_f78", adapter="local", t3_thread=None,
+                    gemini_title="Gem-F78", reply_to=None, label=None, workspace=None,
+                    route="gemini", reply_mode="auto", force=False,
+                ),
+            )
+        loc_uid = self.bridge.pairs()["pairs"]["loc_f78"]["pairUid"]
+
+        # F7: legacy `old.receipt` flat sent/<tid>.json (no payloadRelPath) reads back cleanly while new intake stays blocked
+        r_msg = "Legacy .receipt reply body"
+        r_sha, r_bytes = tb.sha256_text(r_msg)
+        tb.atomic_json(self.root / "sent/old.receipt.json", {"taskId": "old.receipt", "pairId": "loc_f78", "message": r_msg})
+        tb.atomic_json(self.root / "sent/old.receipt.receipt.json", {"taskId": "old.receipt", "accepted": True, "messageSha256": r_sha})
+        tb.atomic_json(self.root / "sent/bad.receipt.json", {"taskId": "bad.receipt", "accepted": True})
+        with self.bridge.ledger_tx() as ld:
+            ld["tasks"]["old.receipt"] = {"status": "sent", "adapter": "t3", "pairId": "loc_f78", "messageSha256": r_sha, "messageBytes": r_bytes}
+            ld["tasks"]["bad.receipt"] = {"status": "sent", "adapter": "t3", "pairId": "loc_f78"}
+        self.assertEqual(self.bridge.read_task_payload("old.receipt")["message"], r_msg)
+        with self.assertRaises(tb.BridgeError) as cm_rec:
+            self.bridge.read_task_payload("bad.receipt")
+        self.assertEqual(str(cm_rec.exception), "archived_payload_corrupted")
+        with self.assertRaises(tb.BridgeError) as cm_blk:
+            self.bridge.submit_task(pair_id="loc_f78", message="New blocked", task_id="old.receipt")
+        self.assertEqual(str(cm_blk.exception), "reserved_task_id_suffix")
+
+        # F8a: v2.1 sent task with corrupted archived payload causes wait_for_task -> rc == 2 + error
+        c_tid = "v21-corrupt-wait"
+        c_orig = "Valid archived text"
+        c_sha, c_bytes = tb.sha256_text(c_orig)
+        tb.atomic_json(self.root / "sent/payloads" / f"{c_tid}.json", {
+            "taskId": c_tid, "pairId": "loc_f78", "pairUid": loc_uid, "message": "CORRUPTED TEXT",
+        })
+        with self.bridge.ledger_tx() as ld:
+            ld["tasks"][c_tid] = {
+                "status": "sent", "adapter": "local", "pairId": "loc_f78", "pairUid": loc_uid,
+                "payloadRelPath": f"sent/payloads/{c_tid}.json",
+                "messageSha256": c_sha, "messageBytes": c_bytes,
+            }
+            ld["dispatches"][c_tid] = {"status": "completed", "adapter": "local", "pairId": "loc_f78", "pairUid": loc_uid}
+        rc_wait_bad, out_wait_bad = self.bridge.wait_for_task(c_tid, timeout_s=0.5)
+        self.assertEqual(rc_wait_bad, 2)
+        self.assertFalse(out_wait_bad["ok"])
+        self.assertEqual(out_wait_bad["error"], "archived_payload_corrupted")
+
+        # F8b: Cutpoint (b) verifies archive BEFORE unlinking sending/, and re-hydrates corrupted archive from sending/
+        h_tid = "cutb-hydrate-1"
+        h_msg = "Intact sending payload recovers corrupt archive"
+        h_sha, h_bytes = tb.sha256_text(h_msg)
+        tb.atomic_json(self.root / "sent/payloads" / f"{h_tid}.json", {
+            "taskId": h_tid, "pairId": "loc_f78", "pairUid": loc_uid, "message": "BROKEN",
+        })
+        tb.atomic_json(self.root / "sent" / f"{h_tid}.receipt.json", {
+            "taskId": h_tid, "accepted": True, "messageSha256": h_sha, "messageBytes": h_bytes,
+        })
+        tb.atomic_json(self.root / "sending" / f"{h_tid}.json", {
+            "taskId": h_tid, "pairId": "loc_f78", "pairUid": loc_uid, "message": h_msg,
+        })
+        with self.bridge.ledger_tx() as ld:
+            ld["tasks"][h_tid] = {
+                "status": "sent", "adapter": "local", "pairId": "loc_f78", "pairUid": loc_uid,
+                "payloadRelPath": f"sent/payloads/{h_tid}.json",
+                "messageSha256": h_sha, "messageBytes": h_bytes,
+            }
+            ld["dispatches"][h_tid] = {"status": "completed", "adapter": "local", "pairId": "loc_f78", "pairUid": loc_uid}
+
+        self.bridge.scan(recover=True)
+        self.assertFalse((self.root / "sending" / f"{h_tid}.json").exists())
+        self.assertEqual(self.bridge.read_task_payload(h_tid)["message"], h_msg)
+
 
 if __name__ == "__main__":
     unittest.main()
