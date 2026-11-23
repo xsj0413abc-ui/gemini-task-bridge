@@ -173,6 +173,9 @@ class BridgeError(Exception):
     """Fixed, non-sensitive error code."""
 
 
+_UNSET: Any = object()
+
+
 def now_iso() -> str:
     return datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="milliseconds")
 
@@ -1541,40 +1544,112 @@ class Bridge:
             # Cutpoint (b): already committed `sent` in ledger before unlink(sending)
             if isinstance(prev, dict) and prev.get("status") == "sent":
                 receipt_abs = self.root / "sent" / f"{tid}.receipt.json"
-                archive_valid = False
+                ledger_rec = prev.get("receipt") if isinstance(prev.get("receipt"), dict) else None
+                expected_sha = prev.get("messageSha256") or (ledger_rec.get("messageSha256") if ledger_rec else None)
+                expected_bytes = prev.get("messageBytes") or (ledger_rec.get("messageBytes") if ledger_rec else None)
+                expected_adapter = prev.get("adapter") or (ledger_rec.get("deliveryAdapter") if ledger_rec else None)
+
+                payload_ok = False
                 try:
                     self.read_task_payload(tid)
-                    rec_check = decode_json(read_bytes(receipt_abs, cfg["max_receipt_file_bytes"]))
-                    if isinstance(rec_check, dict) and rec_check.get("taskId") == tid and rec_check.get("accepted") is True:
-                        archive_valid = True
+                    payload_ok = True
                 except (BridgeError, OSError):
-                    archive_valid = False
-                if archive_valid:
+                    payload_ok = False
+
+                def _receipt_matches(rec_obj: Any) -> bool:
+                    if not isinstance(rec_obj, dict):
+                        return False
+                    if rec_obj.get("taskId") != tid or rec_obj.get("accepted") is not True:
+                        return False
+                    if isinstance(expected_sha, str) and rec_obj.get("messageSha256") != expected_sha:
+                        return False
+                    if isinstance(expected_bytes, int) and rec_obj.get("messageBytes") != expected_bytes:
+                        return False
+                    if isinstance(expected_adapter, str) and rec_obj.get("deliveryAdapter", "t3") != expected_adapter:
+                        return False
+                    if ledger_rec is not None:
+                        if rec_obj.get("acceptedAt") != ledger_rec.get("acceptedAt"):
+                            return False
+                        if rec_obj.get("t3") != ledger_rec.get("t3"):
+                            return False
+                    return True
+
+                ledger_rec_valid = bool(
+                    ledger_rec is not None
+                    and ledger_rec.get("taskId") == tid
+                    and ledger_rec.get("accepted") is True
+                    and (not isinstance(expected_sha, str) or ledger_rec.get("messageSha256") == expected_sha)
+                    and (not isinstance(expected_bytes, int) or ledger_rec.get("messageBytes") == expected_bytes)
+                )
+
+                receipt_ok = False
+                if receipt_abs.exists() and not receipt_abs.is_symlink():
+                    try:
+                        rec_check = decode_json(read_bytes(receipt_abs, cfg["max_receipt_file_bytes"]))
+                        receipt_ok = _receipt_matches(rec_check)
+                    except (BridgeError, OSError):
+                        receipt_ok = False
+
+                if payload_ok and not receipt_ok and ledger_rec_valid:
+                    assert ledger_rec is not None
+                    atomic_json(receipt_abs, ledger_rec)
+                    receipt_ok = True
+
+                if payload_ok and receipt_ok:
                     path.unlink()
                     fsync_dir(path.parent)
                     self._archive_in_flight(tid, "inbox/done")
                     pending.discard(tid)
                     continue
+
                 # If archived payload/receipt missing or corrupted, re-hydrate from intact sending/<tid>.json copy
                 try:
                     raw_obj = decode_json(read_bytes(path, cfg["max_receipt_file_bytes"]))
                     msg = raw_obj.get("message") if isinstance(raw_obj, dict) else None
-                    if isinstance(msg, str) and sha256_text(msg)[0] == prev.get("messageSha256"):
+                    if isinstance(msg, str) and (not isinstance(expected_sha, str) or sha256_text(msg)[0] == expected_sha):
+                        digest, byte_len = sha256_text(msg)
+                        adapter_eff = expected_adapter or "t3"
+                        if ledger_rec_valid:
+                            assert ledger_rec is not None
+                            payload_rel = prev.get("payloadRelPath") or self._payload_relpath_for_task(tid, adapter_eff)
+                            payload_doc: dict[str, Any] = {
+                                "schemaVersion": 2,
+                                "taskId": tid,
+                                "pairId": prev.get("pairId"),
+                                "pairUid": prev.get("pairUid"),
+                                "adapter": adapter_eff,
+                                "captureChannel": raw_obj.get("captureChannel", prev.get("captureChannel", "outbox_json")),
+                                "message": msg,
+                                "messageBytes": byte_len,
+                                "messageSha256": digest,
+                                "archivedAt": ledger_rec.get("acceptedAt") or prev.get("updatedAt") or now_iso(),
+                            }
+                            if prev.get("unregisteredReceipt"):
+                                payload_doc["unregisteredReceipt"] = True
+                            if raw_obj.get("target") is not None:
+                                payload_doc["target"] = raw_obj["target"]
+                            atomic_json(self.root / payload_rel, payload_doc)
+                            atomic_json(receipt_abs, ledger_rec)
+                            path.unlink()
+                            fsync_dir(path.parent)
+                            self._archive_in_flight(tid, "inbox/done")
+                            pending.discard(tid)
+                            continue
                         meta = {
                             "taskId": tid,
-                            "adapter": prev.get("adapter") or "t3",
+                            "adapter": adapter_eff,
                             "resolvedThreadId": prev.get("resolvedThreadId"),
-                            "roleLabel": str((prev.get("receipt") or {}).get("role") or prev.get("pairId") or tid),
+                            "roleLabel": str((ledger_rec or {}).get("role") or prev.get("pairId") or tid),
                             "pairId": prev.get("pairId"),
                             "pairUid": prev.get("pairUid"),
-                            "targetTag": str((prev.get("receipt") or {}).get("target") or prev.get("pairId") or ""),
+                            "targetTag": str((ledger_rec or {}).get("target") or prev.get("pairId") or ""),
                             "unregisteredReceipt": bool(prev.get("unregisteredReceipt")),
                         }
                         self._finalize_outbox_delivery(
                             task_id=tid,
                             raw_data=raw_obj,
                             meta=meta,
-                            delivery_res={"durationMs": 0.0, "t3": (prev.get("receipt") or {}).get("t3")},
+                            delivery_res={"durationMs": 0.0, "t3": (ledger_rec or {}).get("t3")},
                             sending_path=path,
                         )
                         pending.discard(tid)
@@ -2279,6 +2354,7 @@ class Bridge:
                         "updatedAt": now_iso(),
                         "baselineTextLen": 0,
                         "baselineChunks": [],
+                        "baselineUnknown": True,
                     }
                     self.log("legacy_in_flight_hydrated", tid, pairId=pid_name)
 
@@ -2497,6 +2573,13 @@ class Bridge:
                 max_bytes=max(1024, cfg["max_message_bytes"] - 512),
                 max_lines=max(20, cfg["max_message_lines"] - 15),
             )
+            if d_rec.get("baselineUnknown"):
+                start_marker = f"{SENTINEL_START_PREFIX}{tid}{SENTINEL_SUFFIX}"
+                poll_text_str = str(poll.get("text") or "")
+                poll_chunks_list = [c for c in (poll.get("chunks") or []) if isinstance(c, str)]
+                has_start_boundary = (start_marker in poll_text_str) or any(start_marker in c for c in poll_chunks_list)
+                if not (has_start_boundary and has_sentinel):
+                    continue
             if not reply_text:
                 continue
             base_len = int(d_rec.get("baselineTextLen") or 0)
@@ -2542,12 +2625,20 @@ class Bridge:
                         updatedAt=now_iso(),
                     )
 
-    def _reject_inbox_task(self, path: Path, tid: str | None, reason: str) -> None:
+    def _reject_inbox_task(self, path: Path, tid: str | None, reason: str, *, from_filename: bool = False) -> None:
+        if tid is None and path.name.endswith(".task.json"):
+            cand = path.name[:-len(".task.json")]
+            if TASK_ID_RE.fullmatch(cand):
+                tid = cand
+                from_filename = True
         self.move(path, "failed")
         if tid and TASK_ID_RE.fullmatch(tid):
-            with self.ledger_tx() as ld:
+            with self.ledger_tx(enforce_intake_cap=False) as ld:
                 existing = ld["dispatches"].get(tid)
-                if existing is None or existing.get("status") not in TERMINAL_DISPATCH_STATUSES:
+                if from_filename:
+                    if isinstance(existing, dict) and existing.get("status") == "queued":
+                        existing.update(status="failed", reason=reason, updatedAt=now_iso())
+                elif existing is None or (isinstance(existing, dict) and existing.get("status") == "queued"):
                     rec = ld["dispatches"].setdefault(tid, {})
                     rec.update(status="failed", reason=reason, updatedAt=now_iso())
         self.log("inbox_task_rejected", tid, reason)
@@ -2932,9 +3023,11 @@ class Bridge:
         forbid_legacy_pair_uid_deferral: bool = False,
         allowed_adapters: set[str] | frozenset[str] | None = None,
         allow_pairs: set[str] | frozenset[str] | None = None,
-        expected_pair_uid: str | None = None,
+        expected_pair_uid: Any = _UNSET,
         expected_adapter: str | None = None,
         expected_gemini_title: str | None = None,
+        expected_t3_thread_id: Any = _UNSET,
+        expected_default_reply_thread_id: Any = _UNSET,
         require_v21_runtime: bool = False,
     ) -> dict[str, Any]:
         if not isinstance(pair_id, str) or not PAIR_ID_RE.fullmatch(pair_id):
@@ -2989,9 +3082,13 @@ class Bridge:
                     raise BridgeError("pair_not_accessible_in_scope")
                 if expected_adapter is not None and adapter_name != expected_adapter:
                     raise BridgeError("pair_not_accessible_in_scope")
-                if expected_pair_uid is not None and pair.get("pairUid") != expected_pair_uid:
+                if expected_pair_uid is not _UNSET and pair.get("pairUid") != expected_pair_uid:
                     raise BridgeError("pair_not_accessible_in_scope")
                 if expected_gemini_title is not None and pair.get("geminiTitle") != expected_gemini_title:
+                    raise BridgeError("pair_not_accessible_in_scope")
+                if expected_t3_thread_id is not _UNSET and pair.get("t3ThreadId") != expected_t3_thread_id:
+                    raise BridgeError("pair_not_accessible_in_scope")
+                if expected_default_reply_thread_id is not _UNSET and pair.get("defaultReplyThreadId") != expected_default_reply_thread_id:
                     raise BridgeError("pair_not_accessible_in_scope")
 
                 effective = resolve_effective_route(cfg, pair)
@@ -3102,6 +3199,9 @@ class Bridge:
                         "message": message,
                         "createdAt": now_iso(),
                     }
+                    envelope_bytes = encode_json_bytes(envelope)
+                    if len(envelope_bytes) > cfg["max_inbox_bytes"]:
+                        raise BridgeError("inbox_envelope_limit_exceeded")
                     if not v21_ok:
                         # Legacy v2.0 Compat Write Path (no v2.1 dispatches pre-entry; single-link atomic publish)
                         with file_lock(self.root / ".ledger.lock"):
@@ -3112,7 +3212,7 @@ class Bridge:
                         no_symlink(stage_path)
                         stage_fd = os.open(str(stage_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
                         fcntl.flock(stage_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                        os.write(stage_fd, encode_json_bytes(envelope))
+                        os.write(stage_fd, envelope_bytes)
                         os.fsync(stage_fd)
                         fsync_dir(self.root / "inbox")
                     else:
@@ -3121,7 +3221,7 @@ class Bridge:
                         no_symlink(stage_path)
                         stage_fd = os.open(str(stage_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
                         fcntl.flock(stage_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                        os.write(stage_fd, encode_json_bytes(envelope))
+                        os.write(stage_fd, envelope_bytes)
                         os.fsync(stage_fd)
                         fsync_dir(self.root / "inbox")
 

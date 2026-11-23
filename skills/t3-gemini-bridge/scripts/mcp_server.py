@@ -367,6 +367,8 @@ class McpStdioServer:
         expected_pair_uid = pair.get("pairUid")
         expected_adapter = tb.pair_adapter(pair)
         expected_gemini_title = pair["geminiTitle"]
+        expected_t3_thread_id = pair.get("t3ThreadId")
+        expected_default_reply_thread_id = pair.get("defaultReplyThreadId")
 
         wait_flag = bool(args.get("wait", False))
         timeout_s = float(args.get("timeout_seconds", 30.0))
@@ -384,6 +386,8 @@ class McpStdioServer:
                 expected_pair_uid=expected_pair_uid,
                 expected_adapter=expected_adapter,
                 expected_gemini_title=expected_gemini_title,
+                expected_t3_thread_id=expected_t3_thread_id,
+                expected_default_reply_thread_id=expected_default_reply_thread_id,
                 require_v21_runtime=True,
             )
         except tb.BridgeError as exc:

@@ -468,6 +468,67 @@ class McpServerTests(unittest.TestCase):
             rc, _ = c.close()
             self.assertEqual(rc, 0)
 
+    def test_07_legacy_t3_none_uid_binding_preserved(self) -> None:
+        import io
+        from unittest import mock
+        import mcp_server  # noqa: E402
+
+        with self.bridge.pairs_tx() as pdata:
+            pdata["pairs"]["leg_t3"] = {
+                "pairId": "leg_t3", "adapter": "t3", "label": "Legacy T3",
+                "t3ThreadId": "thread-orig", "defaultReplyThreadId": "thread-orig",
+                "allowedReplyThreadIds": ["thread-orig"],
+                "geminiTitle": "Gem-Same-Title", "route": "gemini", "replyMode": "auto", "enabled": True,
+            }
+
+        # 1. Rebind t3ThreadId/defaultReplyThreadId on same legacy pairId/adapter/geminiTitle/pairUid=None -> rejected in lock!
+        scope = mcp_server.McpScope(adapter_filter="all", allow_pairs={"leg_t3"})
+        srv = mcp_server.McpStdioServer(self.bridge, scope, io.BytesIO(), io.BytesIO())
+        try:
+            orig_pairs = self.bridge.pairs
+            swapped = [False]
+
+            def hook_pairs() -> dict:
+                data = orig_pairs()
+                if not swapped[0]:
+                    # Call #1 in _tool_send snapshot leaves original; mutate right before lock read in submit_task
+                    swapped[0] = True
+                    return data
+                data["pairs"]["leg_t3"]["t3ThreadId"] = "thread-evil"
+                data["pairs"]["leg_t3"]["defaultReplyThreadId"] = "thread-evil"
+                data["pairs"]["leg_t3"]["allowedReplyThreadIds"] = ["thread-evil"]
+                tb.atomic_json(self.root / "pairs.json", data)
+                return orig_pairs()
+
+            with mock.patch.object(self.bridge, "pairs", side_effect=hook_pairs):
+                is_err, payload = srv._tool_send({"pair_id": "leg_t3", "message": "Hijacked?"}, threading.Event())
+            self.assertTrue(is_err)
+            self.assertEqual(payload["error"], "pair_not_accessible_in_scope")
+            self.assertEqual(list((self.root / "inbox").glob("*.task.json")), [])
+            self.assertIsNone(self.bridge.pairs()["pairs"]["leg_t3"].get("pairUid"))
+        finally:
+            srv.fast_pool.shutdown(wait=True)
+            srv.wait_pool.shutdown(wait=True)
+
+        # 2. Unchanged legacy T3 pair via real stdio MCP subprocess Succeeds and mints pairUid cleanly
+        c = McpClient(self.root, ["--adapter-filter", "all", "--allow-pairs", "leg_t3"], self.base_env)
+        try:
+            c.send({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18"}})
+            c.recv()
+            c.send({
+                "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                "params": {"name": "gemini_send", "arguments": {"pair_id": "leg_t3", "message": "Unchanged legacy"}},
+            })
+            r_ok = c.recv(timeout=2.0)["result"]
+            self.assertFalse(r_ok["isError"])
+            sc = r_ok["structuredContent"]
+            self.assertEqual(sc["pairId"], "leg_t3")
+            uid = self.bridge.pairs()["pairs"]["leg_t3"].get("pairUid")
+            self.assertIsNotNone(uid)
+        finally:
+            rc, _ = c.close()
+            self.assertEqual(rc, 0)
+
 
 if __name__ == "__main__":
     unittest.main()

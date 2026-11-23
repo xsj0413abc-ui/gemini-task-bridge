@@ -1948,6 +1948,229 @@ class BridgePhase1Tests(unittest.TestCase):
         self.assertFalse((self.root / "sending" / f"{h_tid}.json").exists())
         self.assertEqual(self.bridge.read_task_payload(h_tid)["message"], h_msg)
 
+    def test_review2_p1_legacy_in_flight_unknown_baseline_never_scrapes_prior_turn(self) -> None:
+        with self.bridge.pairs_tx() as pdata:
+            pdata["pairs"]["t3_r2_a"] = {
+                "pairId": "t3_r2_a", "label": "Legacy R2A", "t3ThreadId": "thread-r2a",
+                "defaultReplyThreadId": "thread-r2a", "allowedReplyThreadIds": ["thread-r2a"],
+                "geminiTitle": "Gem-R2A", "route": "gemini", "replyMode": "auto", "enabled": True,
+            }
+        self.ax.add_conv("Gem-R2A")
+        self.ax.current_title = "Gem-R2A"
+        self.ax.conversations["Gem-R2A"]["chunks"].append(
+            "Previous turn final answer that is definitely longer than 8 characters and looks completely stable"
+        )
+
+        # Hydrated legacy in_flight with NO start/done boundary & NO outbox must NOT deliver prior turn!
+        tid1 = "r2a-leg-1"
+        tb.atomic_json(self.root / "inbox/in_flight" / f"{tid1}.task.json", {
+            "schemaVersion": 2, "taskId": tid1, "pairId": "t3_r2_a",
+            "replyThreadId": "thread-r2a", "replyMode": "auto", "message": "Followup without sentinel",
+        })
+        self.bridge.scan(recover=False)
+        with self.bridge.ledger_tx() as ld:
+            self.assertTrue(ld["dispatches"][tid1]["baselineUnknown"])
+            ld["dispatches"][tid1]["dispatchedMono"] = time.monotonic() - 10.0
+
+        self.bridge.scan(recover=False)
+        time.sleep(0.25)
+        self.bridge.scan(recover=False)
+        time.sleep(0.25)
+        self.bridge.scan(recover=False)
+        self.bridge.scan(recover=False)
+        self.assertEqual(self._cli_calls(), [])
+        self.assertFalse((self.root / "outbox" / f"{tid1}.json").exists())
+        self.assertEqual(self.bridge.get_task_status(tid1)["status"], "in_flight")
+
+        # Valid outbox still delivers cleanly for the hydrated task
+        tb.atomic_json(self.root / "outbox" / f"{tid1}.json", {
+            "taskId": tid1, "pairId": "t3_r2_a", "message": "Real outbox reply for r2a",
+        })
+        self.bridge.scan(recover=False)
+        self.assertEqual(self.bridge.get_task_status(tid1)["status"], "sent")
+        self.assertEqual(len(self._cli_calls()), 1)
+        self.assertIn("Real outbox reply for r2a", self._cli_calls()[0]["message"])
+
+        # Case 2: hydrated legacy in_flight WITH BOTH START and DONE boundaries delivers ONLY new text!
+        tid2 = "r2a-leg-2"
+        tb.atomic_json(self.root / "inbox/in_flight" / f"{tid2}.task.json", {
+            "schemaVersion": 2, "taskId": tid2, "pairId": "t3_r2_a",
+            "replyThreadId": "thread-r2a", "replyMode": "auto", "message": "With start and done",
+        })
+        self.bridge.scan(recover=False)
+        with self.bridge.ledger_tx() as ld:
+            ld["dispatches"][tid2]["dispatchedMono"] = time.monotonic() - 10.0
+        self.ax.conversations["Gem-R2A"]["chunks"].extend([
+            f"[[T3_BRIDGE_START:{tid2}]]\n--- TASK ---\nWith start and done",
+            "Bounded new reply only",
+            f"[[T3_BRIDGE_DONE:{tid2}]]",
+        ])
+        self.bridge.scan(recover=False)
+        time.sleep(0.25)
+        self.bridge.scan(recover=False)
+        time.sleep(0.55)
+        self.bridge.scan(recover=False)
+        self.bridge.scan(recover=False)
+        self.assertEqual(self.bridge.get_task_status(tid2)["status"], "sent")
+        calls = self._cli_calls()
+        self.assertEqual(len(calls), 2)
+        self.assertIn("Bounded new reply only", calls[1]["message"])
+        self.assertNotIn("Previous turn final answer", calls[1]["message"])
+
+    def test_review2_p1_legacy_t3_none_uid_rebind_rejected_in_lock(self) -> None:
+        with self.bridge.pairs_tx() as pdata:
+            pdata["pairs"]["t3_r2_b"] = {
+                "pairId": "t3_r2_b", "label": "Legacy R2B", "t3ThreadId": "thread-OLD",
+                "defaultReplyThreadId": "thread-OLD", "allowedReplyThreadIds": ["thread-OLD"],
+                "geminiTitle": "Gem-Same", "route": "gemini", "replyMode": "auto", "enabled": True,
+            }
+
+        orig_pairs = self.bridge.pairs
+
+        def swap_t3_thread_only() -> dict:
+            pdata = orig_pairs()
+            pdata["pairs"]["t3_r2_b"]["t3ThreadId"] = "thread-NEW"
+            pdata["pairs"]["t3_r2_b"]["defaultReplyThreadId"] = "thread-NEW"
+            pdata["pairs"]["t3_r2_b"]["allowedReplyThreadIds"] = ["thread-NEW"]
+            tb.atomic_json(self.root / "pairs.json", pdata)
+            return orig_pairs()
+
+        with mock.patch.object(self.bridge, "pairs", side_effect=swap_t3_thread_only):
+            with self.assertRaises(tb.BridgeError) as cm1:
+                self.bridge.submit_task(
+                    pair_id="t3_r2_b", message="Reject thread swap",
+                    allowed_adapters={"t3"}, expected_pair_uid=None,
+                    expected_adapter="t3", expected_gemini_title="Gem-Same",
+                    expected_t3_thread_id="thread-OLD", expected_default_reply_thread_id="thread-OLD",
+                    require_v21_runtime=True,
+                )
+            self.assertEqual(str(cm1.exception), "pair_not_accessible_in_scope")
+        self.assertEqual(self._cli_calls(), [])
+        self.assertEqual(list((self.root / "inbox").glob("*.task.json")), [])
+        self.assertIsNone(self.bridge.pairs()["pairs"]["t3_r2_b"].get("pairUid"))
+
+        # Case 2: None -> new pairUid swap before lock ALSO rejected when expected_pair_uid=None
+        def swap_none_to_uid() -> dict:
+            pdata = orig_pairs()
+            pdata["pairs"]["t3_r2_b"]["t3ThreadId"] = "thread-OLD"
+            pdata["pairs"]["t3_r2_b"]["defaultReplyThreadId"] = "thread-OLD"
+            pdata["pairs"]["t3_r2_b"]["pairUid"] = "9" * 32
+            tb.atomic_json(self.root / "pairs.json", pdata)
+            return orig_pairs()
+
+        with mock.patch.object(self.bridge, "pairs", side_effect=swap_none_to_uid):
+            with self.assertRaises(tb.BridgeError) as cm2:
+                self.bridge.submit_task(
+                    pair_id="t3_r2_b", message="Reject None->UID swap",
+                    allowed_adapters={"t3"}, expected_pair_uid=None,
+                    expected_adapter="t3", expected_gemini_title="Gem-Same",
+                    require_v21_runtime=True,
+                )
+            self.assertEqual(str(cm2.exception), "pair_not_accessible_in_scope")
+        self.assertEqual(list((self.root / "inbox").glob("*.task.json")), [])
+
+    def test_review2_p1_max_inbox_bytes_precheck_and_queued_failure_settlement(self) -> None:
+        with mock.patch("sys.stdout", new=io.StringIO()):
+            tb.cmd_pair(
+                self.bridge,
+                argparse.Namespace(
+                    pair_cmd="add", id="loc_r2_c", adapter="local", t3_thread=None,
+                    gemini_title="Gem-R2C", reply_to=None, label=None, workspace=None,
+                    route="gemini", reply_mode="auto", force=False,
+                ),
+            )
+        self.ax.add_conv("Gem-R2C")
+
+        # 1. Pre-check rejects serialized envelope > max_inbox_bytes BEFORE reservation/staging
+        cfg = self.bridge.config()
+        cfg["max_inbox_bytes"] = 512
+        self.bridge.save_config(cfg)
+        with self.assertRaises(tb.BridgeError) as cm_env:
+            self.bridge.submit_task(pair_id="loc_r2_c", message="X" * 460, task_id="too-big-pre")
+        self.assertEqual(str(cm_env.exception), "inbox_envelope_limit_exceeded")
+        self.assertEqual(list((self.root / "inbox").glob("*.task.json")), [])
+        self.assertEqual(list((self.root / "inbox").glob("._stage.*")), [])
+        self.assertEqual(self.bridge.get_task_status("too-big-pre")["status"], "not_found")
+
+        # 2. Accepted under large cap, then cap shrunk below file size -> scan moves to failed/ AND settles queued dispatch!
+        cfg["max_inbox_bytes"] = 262144
+        self.bridge.save_config(cfg)
+        self.bridge.submit_task(pair_id="loc_r2_c", message="Y" * 460, task_id="shrink-later-1")
+        self.assertEqual(self.bridge.get_task_status("shrink-later-1")["status"], "queued")
+
+        cfg["max_inbox_bytes"] = 512
+        self.bridge.save_config(cfg)
+        self.bridge.scan(recover=False)
+        self.assertFalse((self.root / "inbox/shrink-later-1.task.json").exists())
+        self.assertTrue((self.root / "failed/shrink-later-1.task.json").exists())
+        st_shrunk = self.bridge.get_task_status("shrink-later-1")
+        self.assertEqual(st_shrunk["status"], "failed")
+        self.assertTrue(st_shrunk["terminal"])
+        self.assertEqual(st_shrunk["reason"], "file_too_large")
+
+        # 3. Oversized bogus inbox file matching an ALREADY in_flight task must NOT clobber its active dispatch status!
+        cfg["max_inbox_bytes"] = 262144
+        self.bridge.save_config(cfg)
+        self.bridge.submit_task(pair_id="loc_r2_c", message="Active ok", task_id="active-r2c-1")
+        self.bridge.scan(recover=False)
+        self.assertEqual(self.bridge.get_task_status("active-r2c-1")["status"], "in_flight")
+        (self.root / "inbox/active-r2c-1.task.json").write_bytes(b"{" + (b"z" * (300 * 1024)) + b"}")
+        self.bridge.scan(recover=False)
+        self.assertTrue((self.root / "failed/active-r2c-1.task.json").exists())
+        self.assertEqual(self.bridge.get_task_status("active-r2c-1")["status"], "in_flight")
+
+    def test_review2_p2_cutpoint_b_receipt_digest_mismatch_restores_original_metadata(self) -> None:
+        with mock.patch("sys.stdout", new=io.StringIO()):
+            tb.cmd_pair(
+                self.bridge,
+                argparse.Namespace(
+                    pair_cmd="add", id="t3_r2_d", adapter="t3", t3_thread="thread-r2d",
+                    gemini_title="Gem-R2D", reply_to=None, label=None, workspace=None,
+                    route="gemini", reply_mode="auto", force=False,
+                ),
+            )
+        t3_uid = self.bridge.pairs()["pairs"]["t3_r2_d"]["pairUid"]
+        tid = "cutb-meta-1"
+        h_msg = "Original T3 reply content"
+        h_sha, h_bytes = tb.sha256_text(h_msg)
+        orig_receipt = {
+            "schemaVersion": 2, "taskId": tid, "role": "t3_r2_d", "target": "t3_r2_d",
+            "pairId": "t3_r2_d", "pairUid": t3_uid, "deliveryAdapter": "t3",
+            "resolvedThreadId": "thread-r2d", "captureChannel": "outbox_json",
+            "payloadRelPath": f"sent/payloads/{tid}.json", "receiptRelPath": f"sent/{tid}.receipt.json",
+            "accepted": True, "acceptedAt": "2026-01-02T03:04:05+00:00",
+            "messageBytes": h_bytes, "messageSha256": h_sha,
+            "cliExitCode": 0, "cliDurationMs": 123.4, "t3": {"runId": "orig-run"},
+        }
+        tb.atomic_json(self.root / "sent/payloads" / f"{tid}.json", {
+            "taskId": tid, "pairId": "t3_r2_d", "pairUid": t3_uid, "message": h_msg,
+        })
+        tb.atomic_json(self.root / "sent" / f"{tid}.receipt.json", {
+            **orig_receipt, "messageSha256": "deadbeef" * 8,
+        })
+        tb.atomic_json(self.root / "sending" / f"{tid}.json", {
+            "taskId": tid, "pairId": "t3_r2_d", "pairUid": t3_uid, "message": h_msg,
+        })
+        with self.bridge.ledger_tx() as ld:
+            ld["tasks"][tid] = {
+                "status": "sent", "adapter": "t3", "pairId": "t3_r2_d", "pairUid": t3_uid,
+                "resolvedThreadId": "thread-r2d", "payloadRelPath": f"sent/payloads/{tid}.json",
+                "receiptRelPath": f"sent/{tid}.receipt.json",
+                "messageSha256": h_sha, "messageBytes": h_bytes, "receipt": orig_receipt,
+            }
+            ld["dispatches"][tid] = {
+                "status": "completed", "adapter": "t3", "pairId": "t3_r2_d", "pairUid": t3_uid,
+            }
+
+        self.bridge.scan(recover=True)
+        self.assertFalse((self.root / "sending" / f"{tid}.json").exists())
+        disk_rec = tb.decode_json((self.root / "sent" / f"{tid}.receipt.json").read_bytes())
+        self.assertEqual(disk_rec["messageSha256"], h_sha)
+        self.assertEqual(disk_rec["acceptedAt"], "2026-01-02T03:04:05+00:00")
+        self.assertEqual(disk_rec["cliDurationMs"], 123.4)
+        self.assertEqual(disk_rec["t3"], {"runId": "orig-run"})
+        self.assertEqual(self.bridge.read_task_payload(tid)["message"], h_msg)
+
 
 if __name__ == "__main__":
     unittest.main()
