@@ -1,5 +1,7 @@
 # t3-gemini-bridge
 
+**Verification status:** Offline bridge and stdio MCP regression tests cover Python 3.9 and 3.12. Real-host end-to-end acceptance for Codex, Claude Code, and Antigravity remains pending (Stage B). Configuration examples are integration instructions, not evidence of a completed host test. See the [acceptance checklist](skills/t3-gemini-bridge/references/mcp-and-multi-agent.md#3-two-stage-acceptance-checklist).
+
 **English** | [简体中文](README.zh-CN.md)
 
 Zero-dependency **1-to-1 automated bridge**, **CLI task runner**, and **stdio MCP server** connecting **T3 Code**, **Claude Code**, **Codex**, and **Antigravity** with Google **Gemini Desktop (`Gemini.app`) Task mode** conversations on macOS.

@@ -2281,6 +2281,10 @@ class Bridge:
         try:
             with file_lock(self.root / ".ledger.lock"):
                 ld = self.ledger()
+            # A frozen dispatch is authoritative, including terminal states.
+            # Discard envelope claims before rebuilding from the ledger so a
+            # damaged pairId cannot temporarily occupy an unrelated pair.
+            result = {pair: tid for pair, tid in result.items() if tid not in ld["dispatches"]}
             for tid, d in ld["dispatches"].items():
                 if (
                     isinstance(d, dict)

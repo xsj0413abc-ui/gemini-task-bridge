@@ -1,5 +1,7 @@
 # t3-gemini-bridge
 
+**验证状态：** 离线桥接与 stdio MCP 回归测试覆盖 Python 3.9 和 3.12；Codex、Claude Code、Antigravity 的真实宿主端到端验收（Stage B）仍待完成。配置示例是接入说明，不代表已完成对应宿主实测。详见[验收清单](skills/t3-gemini-bridge/references/mcp-and-multi-agent.md#3-two-stage-acceptance-checklist)。
+
 [English](README.md) | **简体中文**
 
 零第三方依赖的 **Google Gemini 桌面端（`Gemini.app` Task 模式）1 对 1 全自动桥接工具、任务 CLI 与 stdio MCP Server**（macOS），支持 **T3 Code**、**Claude Code**、**Codex** 与 **Antigravity**。

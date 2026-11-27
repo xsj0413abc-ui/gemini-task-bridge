@@ -2353,6 +2353,17 @@ class BridgePhase1Tests(unittest.TestCase):
         self.assertEqual(st_a["reason"], "invalid_inbox_task")
         self.assertEqual(self.bridge.get_task_status("task-b")["status"], "in_flight")
 
+    def test_active_pair_summary_uses_frozen_dispatch(self) -> None:
+        tb.atomic_json(self.root / "inbox/in_flight/frozen.task.json", {
+            "taskId": "frozen", "pairId": "unrelated",
+        })
+        with self.bridge.ledger_tx() as ld:
+            ld["dispatches"]["frozen"] = {"pairId": "original", "status": "in_flight"}
+        self.assertEqual(self.bridge._active_in_flight_by_pair(), {"original": "frozen"})
+        with self.bridge.ledger_tx() as ld:
+            ld["dispatches"]["frozen"]["status"] = "sent"
+        self.assertEqual(self.bridge._active_in_flight_by_pair(), {})
+
     def test_review4_p1_in_flight_tampered_task_id_isolates_file_and_both_pairs_complete(self) -> None:
         with mock.patch("sys.stdout", new=io.StringIO()):
             tb.cmd_pair(
