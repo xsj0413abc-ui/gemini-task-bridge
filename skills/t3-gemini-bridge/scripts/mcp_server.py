@@ -579,7 +579,7 @@ class McpStdioServer:
         if not status["completed"]:
             return False, out
         if not status["ok"]:
-            if status.get("kind") == kind and "result" in status:
+            if status["status"] == "unconfirmed" and status.get("kind") == kind and "result" in status:
                 out["result"] = status["result"]
             return True, out
         if status["kind"] != kind:

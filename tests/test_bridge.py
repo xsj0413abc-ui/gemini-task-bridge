@@ -66,7 +66,6 @@ class MockAXDriver:
     def list_conversations(self, pid: int) -> dict:
         return {
             "hasWindow": True,
-            "sidebarReadable": True,
             "currentTitle": self.current_title,
             "conversations": [
                 {"raw": k, "title": k, "pinned": False, "badge": v["badge"], "source": "sidebar"}
@@ -1149,16 +1148,6 @@ class BridgePhase1Tests(unittest.TestCase):
         self.assertEqual(self.bridge.get_task_status(r["taskId"])["status"], "in_flight")
 
     def test_p1_3_flat_t3_counts_plus_2_doctor_and_cli_exit_codes(self) -> None:
-        exists = Path.exists
-
-        def offline_exists(path):
-            if path.name == "Info.plist" and path.parent.parent.name == "Gemini.app":
-                return False
-            return exists(path)
-
-        gemini_probe = mock.patch.object(Path, "exists", offline_exists)
-        gemini_probe.start()
-        self.addCleanup(gemini_probe.stop)
         # Doctor with only local pair -> t3CliRequired == False
         with mock.patch("sys.stdout", new=io.StringIO()):
             tb.cmd_pair(

@@ -1082,7 +1082,7 @@ class Bridge:
             return "command_failed"
 
     def write_health(
-        self, probes: dict[str, Any], cfg: dict[str, Any] | None, *, busy: dict[str, Any] | None = None,
+        self, probes: dict[str, Any], cfg: dict[str, Any] | None, *, busy_until: str | None = None,
     ) -> None:
         health = {
             "schemaVersion": 1,
@@ -1098,8 +1098,8 @@ class Bridge:
             "globalMode": cfg.get("global_mode") if cfg else None,
             "lastError": self.last_error,
         }
-        if busy is not None:
-            health["busy"] = busy
+        if busy_until is not None:
+            health["busyUntil"] = busy_until
         try:
             atomic_json(self.root / ".daemon_health.json", health)
         except Exception:
