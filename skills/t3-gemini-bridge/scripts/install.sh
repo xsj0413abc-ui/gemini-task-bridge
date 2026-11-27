@@ -62,7 +62,7 @@ if [[ ! "$LABEL" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ]] || [[ "$LABEL" == *"..
   exit 2
 fi
 
-for f in t3_gemini_bridge.py bridge_ax.py mcp_server.py; do
+for f in control_plane.py t3_gemini_bridge.py bridge_ax.py mcp_server.py; do
   if [[ ! -f "$SCRIPT_DIR/$f" ]]; then
     echo "Error: bundled bridge script not found: $SCRIPT_DIR/$f" >&2
     exit 1
@@ -87,7 +87,7 @@ mkdir -p "$ROOT" "$BIN_DIR"
 chmod 700 "$ROOT"
 
 # Atomic temp-file + chmod + mv install so running processes never read partially copied files
-for f in t3_gemini_bridge.py bridge_ax.py mcp_server.py; do
+for f in control_plane.py t3_gemini_bridge.py bridge_ax.py mcp_server.py; do
   TMP_F="$ROOT/.${f}.tmp.$$"
   cp "$SCRIPT_DIR/$f" "$TMP_F"
   chmod 755 "$TMP_F"
