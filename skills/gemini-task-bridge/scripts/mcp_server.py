@@ -1,5 +1,5 @@
 #!/usr/bin/python3
-"""Zero-dependency Python 3.9+ stdlib MCP stdio server for t3-gemini-bridge."""
+"""Zero-dependency Python 3.9+ stdlib MCP stdio server for gemini-task-bridge."""
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
@@ -16,7 +16,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
-import t3_gemini_bridge as tb  # noqa: E402
+import gemini_task_bridge as tb  # noqa: E402
 import control_plane as cp  # noqa: E402
 
 SUPPORTED_VERSIONS = ("2025-06-18", "2025-03-26", "2024-11-05")
@@ -61,7 +61,7 @@ class McpScope:
         cls, allow_pairs_raw: str | None, adapter_filter_raw: str | None, scope: str | None = None,
     ) -> McpScope:
         if adapter_filter_raw is None:
-            env_af = os.environ.get("T3_GEMINI_BRIDGE_MCP_ADAPTER_FILTER")
+            env_af = tb.bridge_env("MCP_ADAPTER_FILTER")
             adapter_filter = env_af.strip() if env_af is not None else "local"
         else:
             adapter_filter = adapter_filter_raw.strip()
@@ -69,8 +69,8 @@ class McpScope:
             raise tb.BridgeError("invalid_mcp_adapter_filter")
 
         raw_allow = allow_pairs_raw
-        if raw_allow is None and "T3_GEMINI_BRIDGE_MCP_ALLOW_PAIRS" in os.environ:
-            raw_allow = os.environ["T3_GEMINI_BRIDGE_MCP_ALLOW_PAIRS"]
+        if raw_allow is None:
+            raw_allow = tb.bridge_env("MCP_ALLOW_PAIRS")
 
         allow_set: set[str] | None = None
         if raw_allow is not None:
@@ -85,7 +85,7 @@ class McpScope:
                     raise tb.BridgeError("invalid_mcp_allow_pairs")
                 allow_set.add(tok)
         if scope is None:
-            scope = os.environ.get("GEMINI_TASK_BRIDGE_MCP_SCOPE", os.environ.get("T3_GEMINI_BRIDGE_MCP_SCOPE"))
+            scope = tb.bridge_env("MCP_SCOPE")
         return cls(adapter_filter=adapter_filter, allow_pairs=allow_set, scope=scope)
 
     def allowed_adapters(self) -> frozenset[str]:
@@ -309,7 +309,7 @@ class McpStdioServer:
         with tb.file_lock(self.bridge.root / ".ledger.lock"):
             ledger_data = self.bridge.ledger()
         health = self.bridge.read_health() or {}
-        agent = tb.agent_info()
+        agent = tb.agent_info(root=self.bridge.root)
 
         scoped_pairs = {
             pid: p for pid, p in pairs_data["pairs"].items()
@@ -682,7 +682,7 @@ class McpStdioServer:
                 "result": {
                     "protocolVersion": chosen,
                     "capabilities": {"tools": {"listChanged": False}},
-                    "serverInfo": {"name": "t3-gemini-bridge", "version": tb.BRIDGE_VERSION},
+                    "serverInfo": {"name": "gemini-task-bridge", "version": tb.BRIDGE_VERSION},
                 },
             }
 
@@ -962,5 +962,5 @@ def run_stdio_server(
 
 if __name__ == "__main__":
     os.umask(0o077)
-    bridge = tb.Bridge(root=tb.DEFAULT_ROOT)
+    bridge = tb.Bridge()
     sys.exit(run_stdio_server(bridge))

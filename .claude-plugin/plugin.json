@@ -1,13 +1,13 @@
 {
-  "name": "t3-gemini-bridge",
-  "version": "2.1.0",
+  "name": "gemini-task-bridge",
+  "version": "2.2.0",
   "description": "Zero-dependency 1-to-1 automated bridge, CLI task runner, and stdio MCP server connecting T3 Code, Claude Code, Codex, and Antigravity with Google Gemini Desktop Task conversations on macOS.",
   "author": {
     "name": "xsj0413abc-ui",
     "url": "https://github.com/xsj0413abc-ui"
   },
-  "homepage": "https://github.com/xsj0413abc-ui/t3-gemini-bridge",
-  "repository": "https://github.com/xsj0413abc-ui/t3-gemini-bridge",
+  "homepage": "https://github.com/xsj0413abc-ui/gemini-task-bridge",
+  "repository": "https://github.com/xsj0413abc-ui/gemini-task-bridge",
   "license": "MIT",
   "keywords": [
     "t3-code",

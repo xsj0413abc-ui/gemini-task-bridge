@@ -2,9 +2,9 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ROOT="${T3_GEMINI_BRIDGE_ROOT:-$HOME/.local/share/t3-gemini-bridge}"
+ROOT=
 BIN_DIR="$HOME/.local/bin"
-LABEL="${T3_GEMINI_BRIDGE_LABEL:-io.t3-gemini-bridge.daemon}"
+LABEL=
 INSTALL_SERVICE=false
 
 usage() {
@@ -16,9 +16,9 @@ without overwriting any existing pairs.json, bridge_config.json, ledger.json,
 or queue directories.
 
 Options:
-  --root <dir>        Bridge runtime root (default: ~/.local/share/t3-gemini-bridge)
+  --root <dir>        Bridge runtime root (default: ~/.local/share/gemini-task-bridge, or the existing legacy root)
   --bin-dir <dir>     CLI wrapper directory (default: ~/.local/bin)
-  --label <label>     LaunchAgent label (default: io.t3-gemini-bridge.daemon)
+  --label <label>     LaunchAgent label (default: the existing label for this root, or io.gemini-task-bridge.daemon)
   --install-service   Also install and start the macOS LaunchAgent daemon
   -h, --help          Show this help message
 EOF
@@ -27,7 +27,7 @@ EOF
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --root)
-      [[ $# -ge 2 ]] || { echo "Error: --root requires an argument" >&2; exit 2; }
+      [[ $# -ge 2 && -n "$2" ]] || { echo "Error: --root requires an argument" >&2; exit 2; }
       ROOT="$2"
       shift 2
       ;;
@@ -37,7 +37,7 @@ while [[ $# -gt 0 ]]; do
       shift 2
       ;;
     --label)
-      [[ $# -ge 2 ]] || { echo "Error: --label requires an argument" >&2; exit 2; }
+      [[ $# -ge 2 && -n "$2" ]] || { echo "Error: --label requires an argument" >&2; exit 2; }
       LABEL="$2"
       shift 2
       ;;
@@ -57,12 +57,8 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-if [[ ! "$LABEL" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ]] || [[ "$LABEL" == *".."* ]]; then
-  echo "Error: invalid LaunchAgent label: $LABEL" >&2
-  exit 2
-fi
-
-for f in control_plane.py t3_gemini_bridge.py bridge_ax.py mcp_server.py; do
+SCRIPTS=(control_plane.py gemini_task_bridge.py bridge_ax.py mcp_server.py)
+for f in "${SCRIPTS[@]}"; do
   if [[ ! -f "$SCRIPT_DIR/$f" ]]; then
     echo "Error: bundled bridge script not found: $SCRIPT_DIR/$f" >&2
     exit 1
@@ -83,36 +79,59 @@ fi
   exit 1
 }
 
+# Keep installer and CLI defaults in sync without duplicating their lookup rules.
+bridge_python() {
+  "$PY_BIN" -B -c "import sys; sys.path.insert(0, sys.argv.pop(1)); import gemini_task_bridge as tb; $1" "$SCRIPT_DIR" "${@:2}"
+}
+
+ROOT="${ROOT:-$(bridge_python 'print(tb.resolve_default_root())')}"
+LABEL="${LABEL:-$(bridge_python 'print(tb.resolve_default_label(tb.Path(sys.argv[1])))' "$ROOT")}"
+if [[ ! "$LABEL" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ]] || [[ "$LABEL" == *".."* ]]; then
+  echo "Error: invalid LaunchAgent label: $LABEL" >&2
+  exit 2
+fi
+
 mkdir -p "$ROOT" "$BIN_DIR"
 chmod 700 "$ROOT"
 
 # Atomic temp-file + chmod + mv install so running processes never read partially copied files
-for f in control_plane.py t3_gemini_bridge.py bridge_ax.py mcp_server.py; do
+for f in "${SCRIPTS[@]}" t3_gemini_bridge.py; do
+  src="$f"
+  if [[ "$f" == "t3_gemini_bridge.py" ]]; then
+    src="gemini_task_bridge.py"
+  fi
   TMP_F="$ROOT/.${f}.tmp.$$"
-  cp "$SCRIPT_DIR/$f" "$TMP_F"
+  cp "$SCRIPT_DIR/$src" "$TMP_F"
   chmod 755 "$TMP_F"
   mv -f "$TMP_F" "$ROOT/$f"
 done
 
-WRAPPER_TMP="$BIN_DIR/.t3-gemini-bridge.tmp.$$"
+shell_quote() {
+  "$PY_BIN" -B -c 'import shlex, sys; print(shlex.quote(sys.argv[1]))' "$1"
+}
+
+WRAPPER_TMP="$BIN_DIR/.gemini-task-bridge.tmp.$$"
 cat > "$WRAPPER_TMP" <<EOF
 #!/bin/sh
-export T3_GEMINI_BRIDGE_ROOT="\${T3_GEMINI_BRIDGE_ROOT:-$ROOT}"
-export T3_GEMINI_BRIDGE_LABEL="\${T3_GEMINI_BRIDGE_LABEL:-$LABEL}"
-exec $PY_BIN -B "$ROOT/t3_gemini_bridge.py" "\$@"
+# Baked defaults sit behind either prefix; the bridge handles precedence.
+if [ "\${T3_GEMINI_BRIDGE_ROOT+x}" != x ]; then export T3_GEMINI_BRIDGE_ROOT=$(shell_quote "$ROOT"); fi
+if [ "\${T3_GEMINI_BRIDGE_LABEL+x}" != x ]; then export T3_GEMINI_BRIDGE_LABEL=$(shell_quote "$LABEL"); fi
+exec $(shell_quote "$PY_BIN") -B $(shell_quote "$ROOT/gemini_task_bridge.py") "\$@"
 EOF
 chmod 755 "$WRAPPER_TMP"
-mv -f "$WRAPPER_TMP" "$BIN_DIR/t3-gemini-bridge"
+cp -p "$WRAPPER_TMP" "$BIN_DIR/.t3-gemini-bridge.tmp.$$"
+mv -f "$BIN_DIR/.t3-gemini-bridge.tmp.$$" "$BIN_DIR/t3-gemini-bridge"
+mv -f "$WRAPPER_TMP" "$BIN_DIR/gemini-task-bridge"
 
 # Initialize directories/config/ledger safely without touching existing state files
-STATUS_JSON="$(T3_GEMINI_BRIDGE_ROOT="$ROOT" T3_GEMINI_BRIDGE_LABEL="$LABEL" \
-  "$BIN_DIR/t3-gemini-bridge" status --json)"
+STATUS_JSON="$(GEMINI_TASK_BRIDGE_ROOT="$ROOT" GEMINI_TASK_BRIDGE_LABEL="$LABEL" \
+  "$BIN_DIR/gemini-task-bridge" status --json)"
 
-RESOLVED_TCC_PY="$("$PY_BIN" -B -c "import sys; sys.path.insert(0, '$ROOT'); import t3_gemini_bridge as tb; print(tb.resolve_launchagent_python())")"
+RESOLVED_TCC_PY="$(bridge_python 'print(tb.resolve_launchagent_python())')"
 
-echo "Installed t3-gemini-bridge:"
+echo "Installed gemini-task-bridge:"
 echo "  Bridge root : $ROOT"
-echo "  CLI wrapper : $BIN_DIR/t3-gemini-bridge"
+echo "  CLI wrapper : $BIN_DIR/gemini-task-bridge"
 echo "  LaunchAgent : $LABEL"
 echo "  TCC Python  : $RESOLVED_TCC_PY"
 
@@ -122,13 +141,9 @@ if [[ "$(uname -s)" == "Darwin" ]]; then
   fi
 fi
 
-T3_HOME="${T3_GEMINI_BRIDGE_T3_HOME:-$HOME/.t3}"
-if [[ -n "${T3_GEMINI_BRIDGE_CLI:-}" && -x "${T3_GEMINI_BRIDGE_CLI}" ]]; then
-  echo "  T3 CLI      : ${T3_GEMINI_BRIDGE_CLI}"
-elif [[ -x "$T3_HOME/bin/t3" ]]; then
-  echo "  T3 CLI      : $T3_HOME/bin/t3"
-elif command -v t3 >/dev/null 2>&1; then
-  echo "  T3 CLI      : $(command -v t3)"
+T3_CLI="$(bridge_python 'print(tb.resolve_default_t3_cli())')"
+if [[ -x "$T3_CLI" ]]; then
+  echo "  T3 CLI      : $T3_CLI"
 else
   echo "  [info] t3 CLI not found (optional; only required for adapter=t3 pairs; adapter=local and MCP work without it)"
 fi
@@ -158,7 +173,7 @@ esac
 if [[ "$INSTALL_SERVICE" == "true" ]]; then
   echo ""
   echo "Installing LaunchAgent service..."
-  "$BIN_DIR/t3-gemini-bridge" service install
+  GEMINI_TASK_BRIDGE_ROOT="$ROOT" GEMINI_TASK_BRIDGE_LABEL="$LABEL" "$BIN_DIR/gemini-task-bridge" service install
 fi
 
 echo ""
@@ -167,10 +182,10 @@ echo "  1. In macOS System Settings -> Privacy & Security -> Accessibility (and 
 echo "       $RESOLVED_TCC_PY"
 if [[ "$INSTALL_SERVICE" != "true" ]]; then
   echo "  2. Install and start the LaunchAgent daemon:"
-  echo "       $BIN_DIR/t3-gemini-bridge service install"
+  echo "       $BIN_DIR/gemini-task-bridge service install"
   echo "  3. Verify health:"
-  echo "       $BIN_DIR/t3-gemini-bridge doctor --json"
+  echo "       $BIN_DIR/gemini-task-bridge doctor --json"
 else
   echo "  2. Verify health:"
-  echo "       $BIN_DIR/t3-gemini-bridge doctor --json"
+  echo "       $BIN_DIR/gemini-task-bridge doctor --json"
 fi

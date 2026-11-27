@@ -37,7 +37,7 @@ if str(SCRIPT.parent) not in sys.path:
 
 import bridge_ax  # noqa: E402
 
-BRIDGE_VERSION = "2.1.0"
+BRIDGE_VERSION = "2.2.0"
 BRIDGE_CAPABILITIES = ("local_adapter", "task_reservations", "sent_payload_store", "daemon_control_plane")
 
 LEDGER_HARD_MAX_BYTES = 32 * 1024 * 1024
@@ -54,23 +54,34 @@ IDEMPOTENCY_KEY_RE = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
 MCP_SCOPE_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
 
 HOST_HOME = os.environ.get("HOME") or str(Path.home())
-DEFAULT_ROOT = Path(
-    os.environ.get("T3_GEMINI_BRIDGE_ROOT")
-    or str(Path(HOST_HOME) / ".local/share/t3-gemini-bridge")
-)
-DEFAULT_T3_HOME = (
-    os.environ.get("T3_GEMINI_BRIDGE_T3_HOME")
-    or str(Path(HOST_HOME) / ".t3")
-)
-LABEL = os.environ.get("T3_GEMINI_BRIDGE_LABEL") or "io.t3-gemini-bridge.daemon"
-PLIST = Path(HOST_HOME) / "Library/LaunchAgents" / (LABEL + ".plist")
+DEFAULT_LABEL = "io.gemini-task-bridge.daemon"
 
 
-def resolve_default_t3_cli(t3_home: str = DEFAULT_T3_HOME) -> str:
+def bridge_env(name: str, default: str | None = None, *, environ=None) -> str | None:
+    env = os.environ if environ is None else environ
+    return env.get("GEMINI_TASK_BRIDGE_" + name, env.get("T3_GEMINI_BRIDGE_" + name, default))
+
+
+def resolve_default_root() -> Path:
+    override = bridge_env("ROOT")
+    if override:
+        return Path(override)
+    share = Path(os.environ.get("HOME") or HOST_HOME) / ".local/share"
+    modern, legacy = share / "gemini-task-bridge", share / "t3-gemini-bridge"
+    return legacy if not modern.is_dir() and legacy.is_dir() else modern
+
+
+def resolve_default_t3_home() -> str:
+    return bridge_env("T3_HOME") or str(Path(os.environ.get("HOME") or HOST_HOME) / ".t3")
+
+
+def resolve_default_t3_cli(t3_home: str | None = None) -> str:
     """Resolve the `t3` CLI binary via env override, T3 home bin, or PATH."""
-    env_cli = os.environ.get("T3_GEMINI_BRIDGE_CLI", "").strip()
+    env_cli = (bridge_env("CLI") or "").strip()
     if env_cli:
         return env_cli
+    if t3_home is None:
+        t3_home = resolve_default_t3_home()
     local_cli = Path(t3_home) / "bin/t3"
     if local_cli.exists() and os.access(str(local_cli), os.X_OK):
         return str(local_cli)
@@ -82,8 +93,6 @@ def resolve_default_t3_cli(t3_home: str = DEFAULT_T3_HOME) -> str:
         return found
     return str(local_cli)
 
-
-DEFAULT_T3_CLI = resolve_default_t3_cli(DEFAULT_T3_HOME)
 
 DIRS = (
     "inbox",
@@ -789,7 +798,7 @@ DELIVERY_ADAPTERS: dict[str, DeliveryAdapter] = {
 
 
 def _launchagent_dir() -> Path:
-    override = os.environ.get("T3_GEMINI_BRIDGE_LAUNCHAGENT_DIR", "").strip()
+    override = (bridge_env("LAUNCHAGENT_DIR") or "").strip()
     if override:
         return Path(override)
     home_dir = os.environ.get("HOME") or HOST_HOME
@@ -801,15 +810,17 @@ def _extract_root_from_plist(pdata: dict[str, Any]) -> tuple[Path | None, Path |
     prog = pdata.get("ProgramArguments")
     root_val: str | None = None
     script_path: Path | None = None
-    if isinstance(env, dict) and isinstance(env.get("T3_GEMINI_BRIDGE_ROOT"), str):
-        root_val = env["T3_GEMINI_BRIDGE_ROOT"].strip()
+    if isinstance(env, dict):
+        override = bridge_env("ROOT", environ=env)
+        if isinstance(override, str):
+            root_val = override.strip()
     if isinstance(prog, list):
         for i, tok in enumerate(prog):
             if not isinstance(tok, str):
                 continue
             if tok == "--root" and i + 1 < len(prog) and isinstance(prog[i + 1], str):
                 root_val = prog[i + 1].strip()
-            if tok.endswith("t3_gemini_bridge.py"):
+            if Path(tok).name in ("gemini_task_bridge.py", "t3_gemini_bridge.py"):
                 script_path = Path(tok)
     if not root_val:
         return None, script_path
@@ -840,6 +851,14 @@ def _find_launchagents_for_root(root_resolved: Path) -> list[dict[str, Any]]:
         if isinstance(lbl, str) and LABEL_RE.fullmatch(lbl):
             matches.append({"label": lbl, "plistPath": p, "scriptPath": script_path})
     return matches
+
+
+def resolve_default_label(root: Path) -> str:
+    override = bridge_env("LABEL")
+    if override:
+        return override
+    matches = _find_launchagents_for_root(root.resolve())
+    return matches[0]["label"] if matches else DEFAULT_LABEL
 
 
 def _read_file_prefix(path: Path, max_bytes: int = 65536) -> bytes:
@@ -877,13 +896,13 @@ def _script_bridge_version(script_path: Path) -> tuple[int, ...] | None:
 class Bridge:
     def __init__(
         self,
-        root: Path | str = DEFAULT_ROOT,
+        root: Path | str | None = None,
         cli_path: str | None = None,
         t3_home: str | None = None,
         ax_driver: Any = None,
     ) -> None:
-        self.root = Path(root)
-        self.t3_home = t3_home if t3_home is not None else (os.environ.get("T3_GEMINI_BRIDGE_T3_HOME") or DEFAULT_T3_HOME)
+        self.root = Path(root) if root is not None else resolve_default_root()
+        self.t3_home = t3_home if t3_home is not None else resolve_default_t3_home()
         self.cli_path = cli_path if cli_path is not None else resolve_default_t3_cli(self.t3_home)
         self._ax_driver = ax_driver
         self.logger: logging.Logger | None = None
@@ -1174,11 +1193,12 @@ class Bridge:
                 ver = _script_bridge_version(sp)
                 if ver is None or ver < (2, 1, 0):
                     return False, "daemon_upgrade_required_for_v21_features"
-        installed_script = self.root / "t3_gemini_bridge.py"
-        if installed_script.exists():
-            ver = _script_bridge_version(installed_script)
-            if ver is None or ver < (2, 1, 0):
-                return False, "daemon_upgrade_required_for_v21_features"
+        for filename in ("gemini_task_bridge.py", "t3_gemini_bridge.py"):
+            installed_script = self.root / filename
+            if installed_script.exists():
+                ver = _script_bridge_version(installed_script)
+                if ver is None or ver < (2, 1, 0):
+                    return False, "daemon_upgrade_required_for_v21_features"
         return True, "offline_upgraded_root"
 
     def require_v21_runtime_for_root(self, cfg: dict[str, Any] | None = None) -> None:
@@ -3842,20 +3862,18 @@ class Bridge:
         }
 
 
-def _validated_label(label: str | None = None) -> tuple[str, Path]:
-    lbl = LABEL if label is None else label
+def _validated_label(label: str | None = None, *, root: Path | None = None) -> tuple[str, Path]:
+    lbl = resolve_default_label(root if root is not None else resolve_default_root()) if label is None else label
     if not isinstance(lbl, str) or not LABEL_RE.fullmatch(lbl) or ".." in lbl:
         raise BridgeError("invalid_launchagent_label")
-    home_dir = os.environ.get("HOME") or HOST_HOME
-    plist_path = Path(home_dir) / "Library/LaunchAgents" / (lbl + ".plist")
-    return lbl, plist_path
+    return lbl, _launchagent_dir() / (lbl + ".plist")
 
 
-def agent_info(label: str | None = None) -> dict[str, Any]:
+def agent_info(label: str | None = None, *, root: Path | None = None) -> dict[str, Any]:
     if sys.platform != "darwin":
         return {"loaded": False, "reason": "non_macos"}
     try:
-        lbl, _ = _validated_label(label)
+        lbl, _ = _validated_label(label, root=root)
     except BridgeError as exc:
         return {"loaded": False, "reason": str(exc)}
     try:
@@ -3929,7 +3947,7 @@ def cmd_doctor(bridge: Bridge, as_json: bool) -> int:
         "t3CliPath": bridge.cli_path,
         "t3CliExecutable": t3_cli_ok,
         "t3ServerRuntime": t3_runtime,
-        "launchAgent": agent_info(),
+        "launchAgent": agent_info(root=bridge.root),
         "daemonHealth": health,
     }
     if as_json:
@@ -3953,7 +3971,7 @@ def cmd_status(bridge: Bridge, as_json: bool) -> int:
         counts[name] = sum(1 for x in p.iterdir() if x.is_file() and not x.name.startswith((".", "_"))) if p.is_dir() else 0
     info: dict[str, Any] = {
         "bridgeVersion": BRIDGE_VERSION,
-        "agent": agent_info(),
+        "agent": agent_info(root=bridge.root),
         "queueRoot": str(bridge.root),
         "counts": counts,
         "daemonHealth": bridge.read_health(),
@@ -4299,7 +4317,7 @@ def resolve_launchagent_python() -> str:
 
 def install_agent(bridge: Bridge) -> int:
     bridge.setup()
-    label, plist_path = _validated_label()
+    label, plist_path = _validated_label(root=bridge.root)
     no_symlink(plist_path)
     plist_path.parent.mkdir(parents=True, exist_ok=True)
     if plist_path.exists():
@@ -4313,14 +4331,14 @@ def install_agent(bridge: Bridge) -> int:
         "PATH": child_env()["PATH"],
         "PYTHONDONTWRITEBYTECODE": "1",
         "PYTHONUNBUFFERED": "1",
-        "T3_GEMINI_BRIDGE_ROOT": str(bridge.root),
+        "GEMINI_TASK_BRIDGE_ROOT": str(bridge.root),
     }
-    if label != "io.t3-gemini-bridge.daemon" or os.environ.get("T3_GEMINI_BRIDGE_LABEL"):
-        env_vars["T3_GEMINI_BRIDGE_LABEL"] = label
-    if os.environ.get("T3_GEMINI_BRIDGE_CLI"):
-        env_vars["T3_GEMINI_BRIDGE_CLI"] = os.environ["T3_GEMINI_BRIDGE_CLI"]
-    if bridge.t3_home != str(Path(home_dir) / ".t3") or os.environ.get("T3_GEMINI_BRIDGE_T3_HOME"):
-        env_vars["T3_GEMINI_BRIDGE_T3_HOME"] = bridge.t3_home
+    if label != DEFAULT_LABEL or bridge_env("LABEL"):
+        env_vars["GEMINI_TASK_BRIDGE_LABEL"] = label
+    if cli_override := bridge_env("CLI"):
+        env_vars["GEMINI_TASK_BRIDGE_CLI"] = cli_override
+    if bridge.t3_home != str(Path(home_dir) / ".t3") or bridge_env("T3_HOME"):
+        env_vars["GEMINI_TASK_BRIDGE_T3_HOME"] = bridge.t3_home
 
     data = {
         "Label": label,
@@ -4335,7 +4353,7 @@ def install_agent(bridge: Bridge) -> int:
         "StandardOutPath": str(bridge.root / "logs/launchagent.stdout.log"),
         "StandardErrorPath": str(bridge.root / "logs/launchagent.stderr.log"),
     }
-    if agent_info()["loaded"]:
+    if agent_info(label)["loaded"]:
         subprocess.run(["/bin/launchctl", "bootout", f"gui/{os.getuid()}/{label}"], capture_output=True, timeout=15)
     fd = os.open(str(plist_path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
     with os.fdopen(fd, "wb") as stream:
@@ -4345,13 +4363,13 @@ def install_agent(bridge: Bridge) -> int:
     p = subprocess.run(["/bin/launchctl", "bootstrap", f"gui/{os.getuid()}", str(plist_path)], capture_output=True, timeout=15)
     if p.returncode != 0:
         raise BridgeError("launchagent_bootstrap_failed")
-    print(json.dumps({"installed": str(plist_path), "label": label, "pythonExecutable": py_exec, "agent": agent_info()}, ensure_ascii=False))
+    print(json.dumps({"installed": str(plist_path), "label": label, "pythonExecutable": py_exec, "agent": agent_info(label)}, ensure_ascii=False))
     return 0
 
 
-def uninstall_agent() -> int:
-    label, plist_path = _validated_label()
-    info = agent_info()
+def uninstall_agent(root: Path) -> int:
+    label, plist_path = _validated_label(root=root)
+    info = agent_info(label)
     if plist_path.exists():
         no_symlink(plist_path)
         old = plistlib.loads(read_bytes(plist_path, 65536))
@@ -4367,18 +4385,18 @@ def uninstall_agent() -> int:
     return 0
 
 
-def restart_agent() -> int:
-    label, _ = _validated_label()
+def restart_agent(root: Path) -> int:
+    label, _ = _validated_label(root=root)
     p = subprocess.run(["/bin/launchctl", "kickstart", "-k", f"gui/{os.getuid()}/{label}"], capture_output=True, text=True, timeout=15)
     if p.returncode != 0:
         raise BridgeError("launchagent_kickstart_failed")
-    print(json.dumps({"restarted": True, "label": label, "agent": agent_info()}, ensure_ascii=False))
+    print(json.dumps({"restarted": True, "label": label, "agent": agent_info(label)}, ensure_ascii=False))
     return 0
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--root", default=str(DEFAULT_ROOT), help="Bridge root directory")
+    parser.add_argument("--root", default=str(resolve_default_root()), help="Bridge root directory")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     p_doc = sub.add_parser("doctor", help="Check AX, Gemini.app, T3 CLI, and LaunchAgent health")
@@ -4531,11 +4549,11 @@ def main(argv: list[str] | None = None) -> int:
             if args.svc_cmd == "install":
                 return install_agent(bridge)
             if args.svc_cmd == "uninstall":
-                return uninstall_agent()
+                return uninstall_agent(bridge.root)
             if args.svc_cmd == "restart":
-                return restart_agent()
+                return restart_agent(bridge.root)
             if args.svc_cmd == "status":
-                print(json.dumps({"agent": agent_info(), "daemonHealth": bridge.read_health()}, ensure_ascii=False, indent=2))
+                print(json.dumps({"agent": agent_info(root=bridge.root), "daemonHealth": bridge.read_health()}, ensure_ascii=False, indent=2))
                 return 0
         return 2
     except Exception as exc:
@@ -4546,5 +4564,5 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     # Runtime modules import the same BridgeError and locks when invoked as a script.
-    sys.modules.setdefault(SCRIPT.stem, sys.modules[__name__])
+    sys.modules.setdefault("gemini_task_bridge", sys.modules[__name__])
     sys.exit(main())
