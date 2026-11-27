@@ -14,59 +14,41 @@ Only the background LaunchAgent needs macOS Accessibility permission—**Claude 
 
 > **Easiest path:** install the skill, then ask your AI agent (Claude Code, Codex, or Antigravity) to "install and set up gemini-task-bridge". It follows `SKILL.md` and runs every step below for you; you only toggle `Python.app` on in System Settings → Accessibility.
 
-### 1. Install the bridge scripts & CLI
+### 1. Install the CLI and background service
 
 ```bash
 git clone https://github.com/xsj0413abc-ui/gemini-task-bridge.git
 cd gemini-task-bridge
-bash skills/gemini-task-bridge/scripts/install.sh
+bash skills/gemini-task-bridge/scripts/install.sh --install-service --add-to-path
 ```
 
-If `~/.local/bin` is not in your `PATH`, add it to `~/.zshrc` and reload your shell:
+If needed, the installer backs up your existing `~/.zshrc` and adds `~/.local/bin` to the PATH for new zsh shells.
 
-```bash
-export PATH="$HOME/.local/bin:$PATH"
-```
+### 2. Enable Accessibility and check readiness
 
-### 2. Grant Accessibility permission to `Python.app`
+In **System Settings → Privacy & Security → Accessibility**, enable the `Python.app` selected in Finder (add it if it is not listed). If the installer didn't open Settings, use the printed TCC Python path to locate the app.
 
-`install.sh` prints a resolved single-link `TCC Python` path (`.../Python.app/Contents/MacOS/Python`).
+Run `"$HOME/.local/bin/gemini-task-bridge" doctor --json` every few seconds until `ready: true`. Follow `next` if blocked, for example if the service needs a restart or `Gemini.app` isn't running.
 
-1. Open **System Settings → Privacy & Security → Accessibility** and enable that exact `Python.app` (not `/usr/bin/python3`).
-2. If your project folders live in `~/Desktop`, `~/Documents`, or `~/Downloads`, enable the same `Python.app` in **Full Disk Access**.
+### 3. Register MCP in your AI host
 
-### 3. Install and verify the background service
-
-```bash
-gemini-task-bridge service install
-gemini-task-bridge doctor
-```
-
-`doctor` checks `daemon → daemon_accessibility → screen → gemini` in order and tells you the exact next step if anything is not ready. Make sure **Gemini.app** is running and all checks show green (`ready: true` in `doctor --json`).
-
-### 4. Register MCP (and optional Skill) in your AI host
-
-Register the stdio MCP server with `--scope <host>` so each host has its own isolated pairs (up to 10 AI-created pairs per scope):
-
-- **Claude Code:**
+- **Claude Code** (default config)
   ```bash
-  claude mcp add --transport stdio --scope user gemini-task-bridge -- \
+  env -u CLAUDE_CONFIG_DIR claude mcp add --transport stdio --scope user gemini-task-bridge -- \
     "$HOME/.local/bin/gemini-task-bridge" mcp --scope claude-code
   ```
-- **Codex:**
+  Repeat for each custom config directory you use, replacing `env -u CLAUDE_CONFIG_DIR` with `CLAUDE_CONFIG_DIR="/absolute/path/to/config"`.
+- **Codex**
   ```bash
   codex mcp add gemini-task-bridge -- \
     "$HOME/.local/bin/gemini-task-bridge" mcp --scope codex
   ```
-- **Antigravity (`~/.gemini/config/mcp_config.json`):**
-  Replace `<ABS_PATH_TO_BIN>` with the output of `dirname "$(command -v gemini-task-bridge)"` (never put unexpanded `$HOME` inside JSON):
+- **Antigravity** — back up `~/.gemini/config/mcp_config.json` if it exists. Treat a missing or empty file as `{}` and merge only this entry into `mcpServers`. Keep all other entries and keys and use the actual absolute path, not a literal `$HOME`.
   ```json
   {
-    "mcpServers": {
-      "gemini-task-bridge": {
-        "command": "<ABS_PATH_TO_BIN>/gemini-task-bridge",
-        "args": ["mcp", "--scope", "antigravity"]
-      }
+    "gemini-task-bridge": {
+      "command": "<ABS_PATH_TO_BIN>/gemini-task-bridge",
+      "args": ["mcp", "--scope", "antigravity"]
     }
   }
   ```
@@ -84,13 +66,9 @@ Or in Claude Code Plugin Marketplace:
 /plugin install gemini-task-bridge@gemini-task-bridge
 ```
 
-### 5. Open a new session and run your first task
+### 4. Open a new session and verify a reply
 
-Start a fresh session in your AI host and ask it to create a Gemini conversation and run a check, for example:
-
-> "Use gemini-task-bridge to create a Gemini Task conversation named `Code Reviewer` and ask it to review `/abs/path/to/spec.md`."
-
-Your AI will call `gemini_pair_init` (executed silently by the background daemon), then `gemini_send` → `gemini_wait` → `gemini_read`.
+Start a new session in your AI host. Ask your AI to create a uniquely named test conversation with `gemini_pair_init`, ask Gemini to echo a random code with `gemini_send`, then use `gemini_wait` to check that the reply contains the exact code.
 
 ---
 

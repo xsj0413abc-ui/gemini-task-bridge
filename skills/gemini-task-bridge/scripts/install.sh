@@ -6,6 +6,8 @@ ROOT=
 BIN_DIR="$HOME/.local/bin"
 LABEL=
 INSTALL_SERVICE=false
+ADD_TO_PATH=false
+OPEN_ACCESSIBILITY=true
 
 usage() {
   cat <<'EOF'
@@ -20,6 +22,8 @@ Options:
   --bin-dir <dir>     CLI wrapper directory (default: ~/.local/bin)
   --label <label>     LaunchAgent label (default: the existing label for this root, or io.gemini-task-bridge.daemon)
   --install-service   Also install and start the macOS LaunchAgent daemon
+  --add-to-path       Add ~/.local/bin to ~/.zshrc if it is missing from PATH
+  --no-open           Skip opening macOS Accessibility settings and Finder
   -h, --help          Show this help message
 EOF
 }
@@ -43,6 +47,14 @@ while [[ $# -gt 0 ]]; do
       ;;
     --install-service)
       INSTALL_SERVICE=true
+      shift
+      ;;
+    --add-to-path)
+      ADD_TO_PATH=true
+      shift
+      ;;
+    --no-open)
+      OPEN_ACCESSIBILITY=false
       shift
       ;;
     -h|--help)
@@ -161,12 +173,34 @@ sys.exit(0 if (agent.get("loaded") and "local_adapter" not in caps) else 1)
   echo "           Follow the controlled cutover steps (mode t3-all -> drain -> bootout -> bootstrap) before adding local pairs."
 fi
 
+if [[ "$ADD_TO_PATH" == "true" ]]; then
+  case ":$PATH:" in
+    *":$HOME/.local/bin:"*) ;;
+    *)
+      ZSHRC="$HOME/.zshrc"
+      PATH_LINE='export PATH="$HOME/.local/bin:$PATH"'
+      if [[ ! -f "$ZSHRC" ]] || ! grep -Fqx -e "$PATH_LINE" "$ZSHRC"; then
+        if [[ -f "$ZSHRC" ]]; then
+          cp -p "$ZSHRC" "$ZSHRC.gemini-task-bridge.bak"
+        fi
+        # Separate the new export even if the existing file has no final newline.
+        [[ ! -s "$ZSHRC" ]] || printf '\n' >> "$ZSHRC"
+        printf '%s\n' "$PATH_LINE" >> "$ZSHRC"
+      fi
+      ;;
+  esac
+fi
+
 case ":$PATH:" in
   *":$BIN_DIR:"*) ;;
   *)
     echo ""
-    echo "Hint: $BIN_DIR is not in your PATH. Add it in your shell profile:"
-    echo "  export PATH=\"$BIN_DIR:\$PATH\""
+    if [[ "$ADD_TO_PATH" == "true" && "$BIN_DIR" == "$HOME/.local/bin" ]]; then
+      echo "Hint: Start a new zsh shell to load PATH from ~/.zshrc."
+    else
+      echo "Hint: $BIN_DIR is not in your PATH. Add it in your shell profile:"
+      echo "  export PATH=\"$BIN_DIR:\$PATH\""
+    fi
     ;;
 esac
 
@@ -174,6 +208,23 @@ if [[ "$INSTALL_SERVICE" == "true" ]]; then
   echo ""
   echo "Installing LaunchAgent service..."
   GEMINI_TASK_BRIDGE_ROOT="$ROOT" GEMINI_TASK_BRIDGE_LABEL="$LABEL" "$BIN_DIR/gemini-task-bridge" service install
+  if [[ "$OPEN_ACCESSIBILITY" == "true" && "$(uname -s)" == "Darwin" ]]; then
+    sleep 3
+    if GEMINI_TASK_BRIDGE_ROOT="$ROOT" GEMINI_TASK_BRIDGE_LABEL="$LABEL" \
+      "$BIN_DIR/gemini-task-bridge" doctor --json | "$PY_BIN" -c '
+import json, sys
+sys.exit(json.load(sys.stdin).get("stage") != "daemon_accessibility")
+'; then
+      open "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility" || true
+      case "$RESOLVED_TCC_PY" in
+        */Python.app/Contents/MacOS/Python)
+          if open -R "${RESOLVED_TCC_PY%/Contents/MacOS/Python}"; then
+            echo "请把选中的 Python 打开辅助功能开关。"
+          fi
+          ;;
+      esac
+    fi
+  fi
 fi
 
 echo ""
