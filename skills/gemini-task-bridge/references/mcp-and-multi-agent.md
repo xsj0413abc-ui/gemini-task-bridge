@@ -130,7 +130,7 @@ Or combine `--scope <host>` with `--allow-pairs shared_pair` so the host can acc
 
 ### Stage A — Offline Automated Verification (Repo & CI)
 1. `python3 -B -m unittest discover -s tests -v` on both **Python 3.9 (zero pip dependencies)** and **Python 3.12**.
-2. `bash -n skills/gemini-task-bridge/scripts/install.sh` (or `skills/t3-gemini-bridge/scripts/install.sh` prior to directory rename) and CI YAML/JSON/path-hygiene checks.
+2. `bash -n skills/gemini-task-bridge/scripts/install.sh` and CI YAML/JSON/path-hygiene checks.
 3. Offline control-plane, error-catalog, doctor-stage, quota (10-pair limit), scope-isolation, crash-recovery, and stdio MCP protocol suites (`2024-11-05`, `2025-03-26`, `2025-06-18`, camelCase aliases, 8-slot wait saturation, instant `ping`, per-request `notifications/cancelled`, `EOF` shutdown, stdout purity).
 
 ### Stage B — Clean-User Real-Host Verification (Separate from Static Review)

@@ -28,7 +28,7 @@ jobs:
         run: python -B -m unittest discover -s tests -v
 
       - name: Check shell script syntax
-        run: bash -n skills/t3-gemini-bridge/scripts/install.sh
+        run: bash -n skills/gemini-task-bridge/scripts/install.sh
 
       - name: Validate SKILL.md, openai.yaml, and plugin manifests
         run: |
@@ -38,7 +38,7 @@ jobs:
           from pathlib import Path
           import yaml
 
-          skill_dir = Path("skills/t3-gemini-bridge")
+          skill_dir = Path("skills/gemini-task-bridge")
           skill_md = skill_dir / "SKILL.md"
           content = skill_md.read_text(encoding="utf-8")
           assert content.startswith("---"), "SKILL.md must start with YAML frontmatter"

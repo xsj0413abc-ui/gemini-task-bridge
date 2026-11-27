@@ -15,11 +15,11 @@ import time
 import unittest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-SCRIPTS_DIR = REPO_ROOT / "skills/t3-gemini-bridge/scripts"
+SCRIPTS_DIR = REPO_ROOT / "skills/gemini-task-bridge/scripts"
 if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
-import t3_gemini_bridge as tb  # noqa: E402
+import gemini_task_bridge as tb  # noqa: E402
 from test_bridge import OFFLINE_ENV
 
 
@@ -32,7 +32,7 @@ class McpClient:
         env["PYTHONDONTWRITEBYTECODE"] = "1"
         if env_extra:
             env.update(env_extra)
-        cmd = [sys.executable, "-B", str(SCRIPTS_DIR / "t3_gemini_bridge.py"), "--root", str(root), "mcp"] + list(args or [])
+        cmd = [sys.executable, "-B", str(SCRIPTS_DIR / "gemini_task_bridge.py"), "--root", str(root), "mcp"] + list(args or [])
         self.proc = subprocess.Popen(
             cmd,
             stdin=subprocess.PIPE,
@@ -196,7 +196,7 @@ class McpServerTests(unittest.TestCase):
         # Empty / invalid allow-pairs must fail closed at startup (exit 2)
         for bad in ("", "   ", "loc_a,", "bad id"):
             p = subprocess.run(
-                [sys.executable, "-B", str(SCRIPTS_DIR / "t3_gemini_bridge.py"), "--root", str(self.root), "mcp", "--allow-pairs", bad],
+                [sys.executable, "-B", str(SCRIPTS_DIR / "gemini_task_bridge.py"), "--root", str(self.root), "mcp", "--allow-pairs", bad],
                 input=b"",
                 capture_output=True,
                 env={**os.environ, **self.base_env},

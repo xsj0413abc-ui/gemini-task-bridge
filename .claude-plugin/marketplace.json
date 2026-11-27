@@ -1,6 +1,6 @@
 {
   "$schema": "https://json.schemastore.org/claude-code-marketplace.json",
-  "name": "t3-gemini-bridge",
+  "name": "gemini-task-bridge",
   "owner": {
     "name": "xsj0413abc-ui",
     "url": "https://github.com/xsj0413abc-ui"
@@ -8,7 +8,7 @@
   "description": "Zero-dependency 1-to-1 bridge, task CLI, and stdio MCP server connecting T3 Code, Claude Code, Codex, and Antigravity with Google Gemini Desktop Task conversations on macOS.",
   "plugins": [
     {
-      "name": "t3-gemini-bridge",
+      "name": "gemini-task-bridge",
       "source": "./",
       "description": "Zero-dependency 1-to-1 bridge, CLI task runner, and stdio MCP server connecting T3 Code, Claude Code, Codex, and Antigravity with Google Gemini Desktop Task mode on macOS.",
       "category": "productivity",

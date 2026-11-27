@@ -12,7 +12,7 @@ import time
 from typing import Any, Callable
 import uuid
 
-import t3_gemini_bridge as tb
+import gemini_task_bridge as tb
 
 CAPABILITY = "daemon_control_plane"
 MAX_REQUEST_BYTES = 64 * 1024

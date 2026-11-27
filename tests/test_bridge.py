@@ -8,6 +8,7 @@ import io
 import json
 import os
 from pathlib import Path
+import plistlib
 import shutil
 import subprocess
 import sys
@@ -18,13 +19,13 @@ import unittest
 from unittest import mock
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-SCRIPTS_DIR = REPO_ROOT / "skills/t3-gemini-bridge/scripts"
+SCRIPTS_DIR = REPO_ROOT / "skills/gemini-task-bridge/scripts"
 OFFLINE_ENV = {"PYTHONPATH": str(REPO_ROOT / "tests/fixtures/offline"), "PYTHONDONTWRITEBYTECODE": "1"}
 if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
 import bridge_ax  # noqa: E402
-import t3_gemini_bridge as tb  # noqa: E402
+import gemini_task_bridge as tb  # noqa: E402
 
 
 class MockAXDriver:
@@ -647,7 +648,7 @@ class BridgeUnitTests(unittest.TestCase):
 
     def test_25_install_script_dry_isolated_root_and_preserves_state(self) -> None:
         install_sh = SCRIPTS_DIR / "install.sh"
-        iso_root = self.tmp / "iso_share"
+        iso_root = self.tmp / "iso share's root"
         iso_bin = self.tmp / "iso_bin"
         offline_env = {**os.environ, **OFFLINE_ENV, "HOME": str(self.tmp), "T3_GEMINI_BRIDGE_ROOT": str(iso_root)}
 
@@ -661,6 +662,8 @@ class BridgeUnitTests(unittest.TestCase):
         self.assertEqual(res1.returncode, 0, msg=res1.stderr or res1.stdout)
         wrapper = iso_bin / "t3-gemini-bridge"
         self.assertTrue(wrapper.is_file() and os.access(wrapper, os.X_OK))
+        self.assertEqual(wrapper.read_bytes(), (iso_bin / "gemini-task-bridge").read_bytes())
+        self.assertEqual((iso_root / "t3_gemini_bridge.py").read_bytes(), (iso_root / "gemini_task_bridge.py").read_bytes())
 
         status_res = subprocess.run([str(wrapper), "status", "--json"], env=offline_env, capture_output=True, text=True, check=False)
         self.assertEqual(status_res.returncode, 0, msg=status_res.stderr)
@@ -707,6 +710,50 @@ class BridgeUnitTests(unittest.TestCase):
         lbl, plist_path = tb._validated_label("io.example.t3-gemini-bridge")
         self.assertEqual(lbl, "io.example.t3-gemini-bridge")
         self.assertEqual(plist_path.name, "io.example.t3-gemini-bridge.plist")
+
+    def test_default_root_prefers_existing_new_directory_without_moving_legacy_data(self) -> None:
+        share = self.tmp / ".local/share"
+        modern, legacy = share / "gemini-task-bridge", share / "t3-gemini-bridge"
+        with mock.patch.dict(os.environ, {"HOME": str(self.tmp)}, clear=True):
+            self.assertEqual(tb.resolve_default_root(), modern)
+            legacy.mkdir(parents=True)
+            self.assertEqual(tb.resolve_default_root(), legacy)
+            modern.mkdir()
+            self.assertEqual(tb.resolve_default_root(), modern)
+            with mock.patch.dict(os.environ, {"GEMINI_TASK_BRIDGE_ROOT": str(self.root)}):
+                self.assertEqual(tb.resolve_default_root(), self.root)
+        self.assertTrue(legacy.is_dir())
+
+    def test_default_label_reuses_matching_legacy_and_new_plists(self) -> None:
+        directory = self.tmp / "test-launchagents"
+        directory.mkdir()
+        legacy_label = "io.test.legacy"
+        modern_label = "io.test.modern"
+        other_root = self.tmp / "other_root"
+        for label, prefix, root in (
+            (legacy_label, "T3_GEMINI_BRIDGE", self.root),
+            (modern_label, "GEMINI_TASK_BRIDGE", other_root),
+        ):
+            (directory / f"{label}.plist").write_bytes(plistlib.dumps({
+                "Label": label, "EnvironmentVariables": {prefix + "_ROOT": str(root)},
+            }))
+        env = {"HOME": str(self.tmp), "GEMINI_TASK_BRIDGE_LAUNCHAGENT_DIR": str(directory)}
+        with mock.patch.dict(os.environ, env, clear=True):
+            self.assertEqual(tb.resolve_default_label(self.root), legacy_label)
+            self.assertEqual(tb.resolve_default_label(other_root), modern_label)
+            self.assertEqual(tb.resolve_default_label(self.tmp / "unregistered"), tb.DEFAULT_LABEL)
+            with mock.patch.dict(os.environ, {"GEMINI_TASK_BRIDGE_LABEL": "io.test.override"}):
+                self.assertEqual(tb.resolve_default_label(self.root), "io.test.override")
+
+    def test_bridge_env_falls_back_only_when_new_prefix_is_unset(self) -> None:
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertIsNone(tb.bridge_env("MCP_ALLOW_PAIRS"))
+            os.environ["T3_GEMINI_BRIDGE_MCP_ALLOW_PAIRS"] = "legacy"
+            self.assertEqual(tb.bridge_env("MCP_ALLOW_PAIRS"), "legacy")
+            os.environ["GEMINI_TASK_BRIDGE_MCP_ALLOW_PAIRS"] = "modern"
+            self.assertEqual(tb.bridge_env("MCP_ALLOW_PAIRS"), "modern")
+            os.environ["GEMINI_TASK_BRIDGE_MCP_ALLOW_PAIRS"] = ""
+            self.assertEqual(tb.bridge_env("MCP_ALLOW_PAIRS"), "")
 
 
 class BridgePhase1Tests(unittest.TestCase):
@@ -1846,9 +1893,9 @@ class BridgePhase1Tests(unittest.TestCase):
         with tb.file_lock(self.root / ".ledger.lock"):
             self.assertIsNone(self.bridge.ledger()["dispatches"][late_tid]["pairUid"])
 
-    def test_review_f5_offline_gate_accepts_real_v21_script_and_rejects_large_v20(self) -> None:
+    def test_review_f5_offline_gate_accepts_legacy_filename_and_rejects_large_v20(self) -> None:
         import plistlib
-        real_src = SCRIPTS_DIR / "t3_gemini_bridge.py"
+        real_src = SCRIPTS_DIR / "gemini_task_bridge.py"
         installed_dst = self.root / "t3_gemini_bridge.py"
         shutil.copy2(real_src, installed_dst)
         self.assertGreater(installed_dst.stat().st_size, 100_000)
@@ -1861,7 +1908,7 @@ class BridgePhase1Tests(unittest.TestCase):
             "KeepAlive": True,
         }))
 
-        self.assertEqual(tb._script_bridge_version(installed_dst), (2, 1, 0))
+        self.assertEqual(tb._script_bridge_version(installed_dst), (2, 2, 0))
         with mock.patch.object(tb, "agent_info", return_value={"loaded": False}):
             ok_v21, reason_v21 = self.bridge.check_v21_runtime_for_root(self.bridge.config())
             self.assertTrue(ok_v21)
