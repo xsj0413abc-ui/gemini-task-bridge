@@ -24,12 +24,11 @@ Run this decision tree first so you can guide any user from not installed to a c
 
 1. **Installed?**
    - Call `gemini_health` if MCP is connected; otherwise check `command -v gemini-task-bridge` or `~/.local/bin/gemini-task-bridge` (compat alias: `t3-gemini-bridge`).
-   - **Not installed** → Walk the user through **Workflow 1** (v2.2.0 manual steps; do not claim `setup`/`connect` exist yet).
+   - **Not installed** → Walk the user through **Workflow 1**. Run the commands yourself; the user only needs to toggle Accessibility in System Settings.
 2. **Ready? (`doctor`)**
    - Run `gemini-task-bridge doctor --json` (or read `gemini_health` if MCP-only).
    - Judge readiness strictly from `ready` / `daemonHealth`, never `currentProcess.axTrusted` (reference only under `advanced`).
-   - **If `ready != true`**: Read `stage` (`runtime` → `daemon` → `daemon_accessibility` → `screen` → `gemini`) and `next`, and give the user the exact blocker + command/Settings path.
-   - **Stale skills**: If `skillCopies` reports any `stale: true` entry (`version != "2.2.0"`), remind the user to update it.
+   - **If `ready != true`**: Read `stage` (`daemon` → `daemon_accessibility` → `screen` → `gemini`) and `next`, and give the user the exact blocker + command/Settings path.
 3. **Usable pair exists?**
    - Call `gemini_pairs` (MCP) or `gemini-task-bridge pair list --json` (CLI).
    - **No usable pair** → Immediately call **MCP `gemini_pair_init`** (preferred) or CLI `pair init` to create a dedicated Gemini Task chat, then proceed directly to dispatch.
@@ -39,7 +38,7 @@ Run this decision tree first so you can guide any user from not installed to a c
 
 ## Workflow 1 — Manual Setup & Host Registration (v2.2.0)
 
-> **Coming soon (v2.3.0):** `gemini-task-bridge setup` and `gemini-task-bridge connect <claude-code|codex|antigravity>` are not yet available. Follow these manual steps in v2.2.0:
+> Execute these steps for the user. Only step 2 needs the user's hands (one toggle in System Settings).
 
 1. **Install scripts & CLI** (atomic; preserves `pairs.json`, `bridge_config.json`, `ledger.json`):
    ```bash
@@ -98,7 +97,7 @@ On `workspace_not_bookmarked_in_gemini`, ask the user to select that folder once
 
 ## Workflow 3 — Dispatch, Wait & Read Replies
 
-- **MCP (preferred):** `gemini_health`, `gemini_pairs`, `gemini_list_chats`, `gemini_pair_init`, `gemini_send` *(non-blocking by default → `taskId`)*, `gemini_wait` *(chunked `1..300s`)*, `gemini_read`. Accepts snake_case and camelCase aliases (`pairId`, `taskId`, `idempotencyKey`); unknown args return accepted names.
+- **MCP (preferred):** `gemini_health`, `gemini_pairs`, `gemini_list_chats`, `gemini_pair_init`, `gemini_send` *(non-blocking by default → `taskId`)*, `gemini_wait` *(chunked `1..300s`)*, `gemini_read`. Accepts snake_case and camelCase aliases (`pairId`, `taskId`, `idempotencyKey`).
 - **CLI:**
   ```bash
   gemini-task-bridge send --pair "<pair-id>" --idempotency-key "req-001" --message "Review /abs/path/to/spec.md"

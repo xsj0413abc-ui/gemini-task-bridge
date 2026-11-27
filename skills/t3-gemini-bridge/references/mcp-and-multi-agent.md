@@ -28,7 +28,7 @@
 
 ## 2. MCP Tool Reference
 
-All tool schemas declare snake_case parameter names; the server also accepts camelCase aliases (`pair_id`/`pairId`, `task_id`/`taskId`, `idempotency_key`/`idempotencyKey`). Passing an unknown argument returns an error listing the tool's accepted parameter names. Every tool error payload includes `error`, plus localized `message` and `fix`.
+All tool schemas declare snake_case parameter names; the server also accepts camelCase aliases (`pair_id`/`pairId`, `task_id`/`taskId`, `idempotency_key`/`idempotencyKey`). Every tool error payload includes `error`, plus localized `message` and `fix`.
 
 | Tool | Purpose | Parameters | Key Behavior |
 | --- | --- | --- | --- |
@@ -44,7 +44,7 @@ All tool schemas declare snake_case parameter names; the server also accepts cam
 
 ## 3. Host-Native Configurations
 
-> **Coming soon (v2.3.0):** `gemini-task-bridge connect <claude-code|codex|antigravity> [--check]` will automate MCP registration, skill linking, and a live `gemini_health` check. In **v2.2.0**, use the manual configurations below, then **open a new session** in your host.
+> Your AI agent can run these registration commands itself. Afterwards, **open a new session** in the host so the new tools load.
 
 > Replace `<ABS_PATH_TO_BIN>` with the actual resolved directory from `dirname "$(command -v gemini-task-bridge)"` (never write literal unexpanded `$HOME` inside static JSON or TOML fields). Omit `GEMINI_TASK_BRIDGE_ROOT` when using the default root.
 

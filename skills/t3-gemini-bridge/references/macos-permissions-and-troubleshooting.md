@@ -32,15 +32,11 @@ Run `gemini-task-bridge doctor` (human-readable `✅`/`❌` + next step) or `gem
 
 | `stage` | Meaning | Typical Fix |
 | --- | --- | --- |
-| `runtime` | Bridge scripts/root or Python 3.9+ runtime missing/invalid | Re-run `bash scripts/install.sh` and check `python3 --version`. |
 | `daemon` | LaunchAgent is not installed, not running, or heartbeat is stale | Run `gemini-task-bridge service install` (or `service restart`). |
 | `daemon_accessibility` | Running LaunchAgent reports `daemonHealth.axTrusted == false` | Enable the resolved `Python.app` in **System Settings → Privacy & Security → Accessibility**, then run `gemini-task-bridge service restart`. |
 | `screen` | Mac display is locked (`daemonHealth.screenLocked == true`) | Unlock macOS; queued tasks and control requests resume automatically. |
 | `gemini` | `Gemini.app` is not running (`daemonHealth.geminiRunning == false`) | Launch `/Applications/Gemini.app`, then re-run `gemini-task-bridge doctor`. |
 | `ok` | All checks passed (`ready: true`) | Ready to create pairs (`gemini_pair_init`) and dispatch tasks (`gemini_send`). |
-
-### `skillCopies` Drift Detection (Read-Only)
-`doctor --json` inspects `~/.agents/skills`, `~/.claude/skills`, `$CLAUDE_CONFIG_DIR/skills`, `~/.claude-*/skills`, `~/.codex/skills`, `~/.gemini/skills`, `~/.gemini/antigravity/skills`, and `~/.gemini/config/skills` for directories named `gemini-task-bridge` or `t3-gemini-bridge`. It reads `version` from each `SKILL.md` frontmatter and reports `path`, `realpath`, `version`, and `stale` (`version != BRIDGE_VERSION`). `doctor` never mutates skill files automatically; update any `stale: true` copy manually or via your host's skill installer.
 
 ---
 

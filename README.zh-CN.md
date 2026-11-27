@@ -12,7 +12,7 @@
 
 只有后台守护进程（LaunchAgent）需要 macOS 辅助功能权限——**Claude Code、Codex、Antigravity 和终端都不需要辅助功能权限**。
 
-> **v2.3.0 即将提供：** 一键引导 `gemini-task-bridge setup` 与一键接入 `gemini-task-bridge connect <claude-code|codex|antigravity>` 将在下一批发布。在当前 **v2.2.0** 版本中，按下面 5 步手动完成即可。
+> **最省事的用法：** 装好技能后，直接对你的 AI（Claude Code、Codex 或 Antigravity）说「帮我安装并配置 gemini-task-bridge」。它会按 `SKILL.md` 替你执行下面每一步，你只需要在「系统设置 → 隐私与安全性 → 辅助功能」里打开 `Python.app` 的开关。
 
 ### 1. 安装桥接脚本与命令行
 
@@ -42,7 +42,7 @@ gemini-task-bridge service install
 gemini-task-bridge doctor
 ```
 
-`doctor` 会按 `runtime → daemon → daemon_accessibility → screen → gemini` 顺序逐项检查，若未就绪会直接告诉你卡在哪一步和下一条命令。确认 **Gemini.app** 已打开且全部通过（`doctor --json` 中 `ready: true`）。
+`doctor` 会按 `daemon → daemon_accessibility → screen → gemini` 顺序逐项检查，若未就绪会直接告诉你卡在哪一步和下一条命令。确认 **Gemini.app** 已打开且全部通过（`doctor --json` 中 `ready: true`）。
 
 ### 4. 在宿主中注册 MCP（以及可选的 Skill）
 
@@ -101,7 +101,7 @@ AI 会自动调用 `gemini_pair_init`（由后台服务代建，宿主无需辅�
   - 每个 `--scope` 上限 **10 个启用配对**，支持幂等键防重与崩溃中断恢复。
 - **报错说人话 + 分阶段 `doctor` 体检**：
   - 所有 CLI 和 MCP 报错都自带大白话 `message` 与下一步操作 `fix`（支持中英文切换，优先读 `GEMINI_TASK_BRIDGE_LANG=zh|en`，其次看 `LANG`/`LC_ALL`，默认英文）。
-  - `gemini-task-bridge doctor` 以后台健康状态为准，按阶段输出 `✅/❌` 与下一步指令，并只读检测各宿主目录下的旧版技能副本漂移（`skillCopies`）。
+  - `gemini-task-bridge doctor` 以后台健康状态为准，按阶段输出 `✅/❌` 与下一步指令。
 - **多宿主隔离的零依赖 Stdio MCP Server（`gemini-task-bridge mcp`）**：
   - 纯 Python 3.9+ 标准库实现 JSON-RPC 2.0，兼容 MCP `2025-06-18`、`2025-03-26`（支持 batch）与 `2024-11-05`。
   - 通过 `--scope <name>` 隔离不同宿主的配对与任务；工具参数同时兼容蛇形与驼峰（`pair_id`/`pairId`、`task_id`/`taskId`、`idempotency_key`/`idempotencyKey`）；默认 `--adapter-filter local`，不碰线上 T3 配对。

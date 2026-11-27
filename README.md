@@ -12,7 +12,7 @@ Bridge **Claude Code**, **Codex**, **Antigravity**, and **T3 Code** directly to 
 
 Only the background LaunchAgent needs macOS Accessibility permission—**Claude Code, Codex, Antigravity, and your terminal do not**.
 
-> **Coming in v2.3.0:** Guided `gemini-task-bridge setup` and one-command `gemini-task-bridge connect <claude-code|codex|antigravity>` are planned for the next release. In **v2.2.0**, follow the 5 manual steps below.
+> **Easiest path:** install the skill, then ask your AI agent (Claude Code, Codex, or Antigravity) to "install and set up gemini-task-bridge". It follows `SKILL.md` and runs every step below for you; you only toggle `Python.app` on in System Settings → Accessibility.
 
 ### 1. Install the bridge scripts & CLI
 
@@ -42,7 +42,7 @@ gemini-task-bridge service install
 gemini-task-bridge doctor
 ```
 
-`doctor` checks `runtime → daemon → daemon_accessibility → screen → gemini` in order and tells you the exact next step if anything is not ready. Make sure **Gemini.app** is running and all checks show green (`ready: true` in `doctor --json`).
+`doctor` checks `daemon → daemon_accessibility → screen → gemini` in order and tells you the exact next step if anything is not ready. Make sure **Gemini.app** is running and all checks show green (`ready: true` in `doctor --json`).
 
 ### 4. Register MCP (and optional Skill) in your AI host
 
@@ -101,7 +101,7 @@ Your AI will call `gemini_pair_init` (executed silently by the background daemon
   - Per-scope quota of **10 enabled pairs** prevents runaway chat creation, with idempotent request keys and crash-safe startup recovery.
 - **Human-Readable Bilingual Errors & Stage-by-Stage `doctor`**:
   - Every CLI and MCP error includes a plain-language `message` and actionable `fix` in Chinese or English (controlled by `GEMINI_TASK_BRIDGE_LANG=zh|en`, falling back to `LANG`/`LC_ALL`, default `en`).
-  - `gemini-task-bridge doctor` evaluates background daemon health (`runtime → daemon → daemon_accessibility → screen → gemini → ok`) and detects stale installed skill copies (`skillCopies`).
+  - `gemini-task-bridge doctor` evaluates background daemon health (`daemon → daemon_accessibility → screen → gemini → ok`).
 - **Multi-Host Scoped Stdio MCP Server (`gemini-task-bridge mcp`)**:
   - Zero-dependency Python 3.9+ stdlib JSON-RPC 2.0 supporting MCP `2025-06-18`, `2025-03-26` (batch), and `2024-11-05`.
   - `--scope <name>` isolates pairs and tasks per host; accepts both snake_case and camelCase IDs (`pair_id`/`pairId`, `task_id`/`taskId`, `idempotency_key`/`idempotencyKey`); defaults to `--adapter-filter local` so T3 production pairs stay untouched.

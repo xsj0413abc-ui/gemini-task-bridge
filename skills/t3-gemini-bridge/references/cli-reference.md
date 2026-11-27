@@ -39,7 +39,7 @@ Global flag: `--root <dir>` overrides `GEMINI_TASK_BRIDGE_ROOT` for any subcomma
 | Item | v2.2.0 Name | Backwards Compatibility |
 | --- | --- | --- |
 | Skill directory | `skills/gemini-task-bridge/` | Replaced via `git mv` in release packaging |
-| Skill frontmatter | `name: gemini-task-bridge`, `metadata.version: "2.2.0"` | `doctor` `skillCopies` scans both `gemini-task-bridge` and `t3-gemini-bridge` dirs |
+| Skill frontmatter | `name: gemini-task-bridge`, `metadata.version: "2.2.0"` | Old `t3-gemini-bridge` skill copies keep working; reinstall to pick up the new name |
 | Main script | `scripts/gemini_task_bridge.py` (`mcp_server.py` imports `gemini_task_bridge`) | `install.sh` also installs an identical `t3_gemini_bridge.py` copy in `$ROOT` so existing LaunchAgents and version checks keep working |
 | CLI command | `~/.local/bin/gemini-task-bridge` | `~/.local/bin/t3-gemini-bridge` wrapper installed alongside with identical content and zero stdout output (MCP stdio safe) |
 | Environment variables | `GEMINI_TASK_BRIDGE_*` | Falls back to matching `T3_GEMINI_BRIDGE_*` when unset |
@@ -57,16 +57,15 @@ Global flag: `--root <dir>` overrides `GEMINI_TASK_BRIDGE_ROOT` for any subcomma
 
 ```bash
 gemini-task-bridge doctor          # Concise human-readable ✅/❌ checklist + exact next step
-gemini-task-bridge doctor --json   # Structured JSON with ready, stage, next, daemonHealth, advanced, skillCopies
+gemini-task-bridge doctor --json   # Structured JSON with ready, stage, next, daemonHealth, advanced
 gemini-task-bridge status [--json] # Includes counts["sent"], counts["sent/payloads"], and all dispatchStates
 ```
 
 `doctor --json` fields added in v2.2.0 (all previous fields preserved):
 - `ready` (`bool`): overall readiness, evaluated strictly from `daemonHealth`.
-- `stage` (`str`): first failing stage in order: `runtime` → `daemon` → `daemon_accessibility` → `screen` → `gemini` → `ok`.
+- `stage` (`str`): first failing stage in order: `daemon` → `daemon_accessibility` → `screen` → `gemini` → `ok`.
 - `next` (`str`): one-line plain-language guidance and command/System Settings path.
 - `advanced`: includes `currentProcess` (for reference only; does not gate `ready`).
-- `skillCopies`: read-only scan of `~/.agents/skills`, `~/.claude/skills`, `$CLAUDE_CONFIG_DIR/skills`, `~/.claude-*/skills`, `~/.codex/skills`, `~/.gemini/skills`, `~/.gemini/antigravity/skills`, `~/.gemini/config/skills` for `t3-gemini-bridge` or `gemini-task-bridge` directories, reporting `path`, `realpath`, `version`, and `stale` (`version != BRIDGE_VERSION`).
 
 ### Mode Switching
 
@@ -181,11 +180,6 @@ gemini-task-bridge service install       # Blocks on conflicting LaunchAgent lab
 gemini-task-bridge service restart
 gemini-task-bridge service uninstall     # Removes plist only; preserves queue, pairs, and ledger history
 ```
-
-### Upcoming Commands (v2.3.0 — Not Yet Available)
-
-- `gemini-task-bridge setup` (coming soon): guided install/upgrade, Accessibility picker helper, optional `~/.zshrc` PATH setup, and end-to-end smoke test.
-- `gemini-task-bridge connect <claude-code|codex|antigravity> [--check]` (coming soon): automated MCP registration (`--scope`), skill linking, and live `gemini_health` verification.
 
 ---
 
