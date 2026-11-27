@@ -1081,7 +1081,9 @@ class Bridge:
         except (OSError, subprocess.TimeoutExpired):
             return "command_failed"
 
-    def write_health(self, probes: dict[str, Any], cfg: dict[str, Any] | None) -> None:
+    def write_health(
+        self, probes: dict[str, Any], cfg: dict[str, Any] | None, *, busy: dict[str, Any] | None = None,
+    ) -> None:
         health = {
             "schemaVersion": 1,
             "bridgeVersion": BRIDGE_VERSION,
@@ -1096,6 +1098,8 @@ class Bridge:
             "globalMode": cfg.get("global_mode") if cfg else None,
             "lastError": self.last_error,
         }
+        if busy is not None:
+            health["busy"] = busy
         try:
             atomic_json(self.root / ".daemon_health.json", health)
         except Exception:
@@ -1146,11 +1150,8 @@ class Bridge:
                 return False, "daemon_upgrade_required_for_v21_features"
             if _parse_version_tuple(str(health.get("bridgeVersion") or "")) < (2, 1, 0):
                 return False, "daemon_upgrade_required_for_v21_features"
-            scan_dt = parse_iso_utc(health.get("lastScanAt"))
-            if scan_dt is None:
-                return False, "daemon_upgrade_required_for_v21_features"
-            age_s = (datetime.datetime.now(datetime.timezone.utc) - scan_dt).total_seconds()
-            if age_s > max(15.0, 3.0 * poll_s):
+            import control_plane
+            if not control_plane.health_fresh(health, max(15.0, 3.0 * poll_s)):
                 return False, "daemon_upgrade_required_for_v21_features"
             return True, "live_v21_daemon"
 
@@ -4145,6 +4146,10 @@ def cmd_pair(bridge: Bridge, args: argparse.Namespace) -> int:
                 "createdAt": (prev or {}).get("createdAt") or now_iso(),
                 "updatedAt": now_iso(),
             }
+            if prev is not None and pair_uid == prev.get("pairUid"):
+                for field in ("ownerScope", "createdVia", "controlRequestId"):
+                    if field in prev:
+                        pdata["pairs"][args.id][field] = prev[field]
         print(json.dumps({"ok": True, "pair": pdata["pairs"][args.id]}, ensure_ascii=False, indent=2))
         return 0
 

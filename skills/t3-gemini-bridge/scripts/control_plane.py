@@ -18,7 +18,7 @@ CAPABILITY = "daemon_control_plane"
 MAX_REQUEST_BYTES = 64 * 1024
 MAX_RESULT_BYTES = 2 * 1024 * 1024
 MAX_PAIRS_BYTES = 512 * 1024
-IN_FLIGHT_META_BYTES = 32
+IN_FLIGHT_META_BYTES = 128
 MAX_RESULTS = 500
 RETENTION_SECONDS = 7 * 24 * 60 * 60
 PAIR_LIMIT = 10
@@ -28,7 +28,7 @@ TERMINAL = ("ok", "failed", "unconfirmed")
 
 def setup(bridge: tb.Bridge) -> None:
     root = bridge.root / "control"
-    for path in (root, *(root / name for name in ("inbox", "in_flight", "done", "keys"))):
+    for path in (root, *(root / name for name in ("inbox", "in_flight", "done", "keys", "retired"))):
         tb.no_symlink(path)
         path.mkdir(mode=0o700, exist_ok=True)
         info = path.lstat()
@@ -43,6 +43,20 @@ def _parse_stamp(value: Any) -> datetime.datetime | None:
         return None
 
 
+def health_fresh(health: dict[str, Any], ttl: float) -> bool:
+    now = datetime.datetime.now(datetime.timezone.utc)
+    stamp = _parse_stamp(health.get("lastScanAt"))
+    if stamp is None or stamp > now:
+        return False
+    if (now - stamp).total_seconds() <= ttl:
+        return True
+    busy = health.get("busy")
+    if not isinstance(busy, dict) or busy.get("kind") != "create_pair" or not _is_uid(busy.get("requestId")):
+        return False
+    until = _parse_stamp(busy.get("until"))
+    return until is not None and until > now
+
+
 def daemon_available(bridge: tb.Bridge, cfg: dict[str, Any]) -> bool:
     try:
         health = _read(bridge.root / ".daemon_health.json", MAX_REQUEST_BYTES)
@@ -51,11 +65,7 @@ def daemon_available(bridge: tb.Bridge, cfg: dict[str, Any]) -> bool:
     if not isinstance(health, dict) or health.get("axTrusted") is not True:
         return False
     caps = health.get("capabilities")
-    stamp = _parse_stamp(health.get("lastScanAt"))
-    if not isinstance(caps, list) or CAPABILITY not in caps or stamp is None:
-        return False
-    age = (datetime.datetime.now(datetime.timezone.utc) - stamp).total_seconds()
-    return 0 <= age <= 3 * cfg["poll_interval_seconds"] + 10
+    return isinstance(caps, list) and CAPABILITY in caps and health_fresh(health, 3 * cfg["poll_interval_seconds"] + 10)
 
 
 def validate_scope(scope: Any) -> None:
@@ -91,21 +101,23 @@ def _read(path: Path, limit: int) -> Any:
     return tb.decode_json(tb.read_bytes(path, limit, private=True))
 
 
+def _is_uid(value: Any) -> bool:
+    return isinstance(value, str) and tb.PAIR_UID_RE.fullmatch(value) is not None
+
+
 def _read_key(path: Path) -> dict[str, Any] | None:
     try:
         key = _read(path, 1024)
     except FileNotFoundError:
         return None
-    if (not isinstance(key, dict) or not isinstance(key.get("requestId"), str)
-            or not tb.PAIR_UID_RE.fullmatch(key["requestId"]) or key.get("kind") not in KINDS
-            or ("retired" in key and key["retired"] not in TERMINAL)):
+    if not isinstance(key, dict) or not _is_uid(key.get("requestId")) or key.get("kind") not in KINDS:
         raise tb.BridgeError("invalid_control_request")
     return key
 
 
 def _validate_request(data: Any, rid: str, *, in_flight: bool = False) -> dict[str, Any]:
     fields = {"schemaVersion", "requestId", "kind", "idempotencyKey", "source", "createdAt", "params"}
-    if not isinstance(data, dict) or (set(data) - fields - ({"axReady"} if in_flight else set())) or fields - set(data):
+    if not isinstance(data, dict) or (set(data) - fields - ({"axReady", "pairUid"} if in_flight else set())) or fields - set(data):
         raise tb.BridgeError("invalid_control_request")
     source, key = data["source"], data["idempotencyKey"]
     if (type(data["schemaVersion"]) is not int or data["schemaVersion"] != 1 or data["requestId"] != rid
@@ -114,6 +126,7 @@ def _validate_request(data: Any, rid: str, *, in_flight: bool = False) -> dict[s
             or not isinstance(source, dict) or set(source) != {"scope", "via"}
             or source["via"] not in ("cli", "mcp")
             or ("axReady" in data and (data["kind"] != "create_pair" or data["axReady"] is not True))
+            or ("pairUid" in data and (data["kind"] != "create_pair" or not _is_uid(data["pairUid"])))
             or not isinstance(data["params"], dict)):
         raise tb.BridgeError("invalid_control_request")
     if source["via"] == "mcp":
@@ -125,11 +138,15 @@ def _validate_request(data: Any, rid: str, *, in_flight: bool = False) -> dict[s
     return data
 
 
-def _read_request(root: Path, path: Path, rid: str, *, in_flight: bool = False) -> dict[str, Any]:
+def _read_envelope(path: Path, rid: str, *, in_flight: bool = False) -> dict[str, Any]:
     limit = MAX_REQUEST_BYTES + IN_FLIGHT_META_BYTES if in_flight else MAX_REQUEST_BYTES
-    req = _validate_request(_read(path, limit), rid, in_flight=in_flight)
+    return _validate_request(_read(path, limit), rid, in_flight=in_flight)
+
+
+def _read_request(root: Path, path: Path, rid: str, *, in_flight: bool = False) -> dict[str, Any]:
+    req = _read_envelope(path, rid, in_flight=in_flight)
     key = _read_key(_key_path(root, req["source"]["scope"], req["idempotencyKey"]))
-    if not key or key.get("retired") or key["requestId"] != rid or key["kind"] != req["kind"]:
+    if not key or key["requestId"] != rid or key["kind"] != req["kind"]:
         raise tb.BridgeError("invalid_control_request")
     return req
 
@@ -155,24 +172,131 @@ def _pending(rid: str) -> dict[str, Any]:
     return {"ok": False, "completed": False, "requestId": rid, "status": "pending"}
 
 
-def _read_done(root: Path, rid: str) -> dict[str, Any] | None:
-    try:
-        done = _read(_path(root, "done", rid), MAX_RESULT_BYTES)
-    except FileNotFoundError:
-        return None
+def _is_text(value: Any) -> bool:
+    return isinstance(value, str) and bool(value.strip())
+
+
+def _valid_chat_list(result: Any) -> bool:
+    return (
+        isinstance(result, dict) and {"hasWindow", "currentTitle", "conversations"} <= set(result)
+        and not (set(result) - {"hasWindow", "currentTitle", "conversations", "sidebarReadable"})
+        and type(result["hasWindow"]) is bool
+        and ("sidebarReadable" not in result or type(result["sidebarReadable"]) is bool)
+        and (result["currentTitle"] is None or isinstance(result["currentTitle"], str))
+        and isinstance(result["conversations"], list)
+        and all(isinstance(chat, dict) and _is_text(chat.get("title")) and chat.get("source") in ("sidebar", "menubar")
+                for chat in result["conversations"])
+    )
+
+
+def _request_target(req: dict[str, Any]) -> dict[str, Any]:
+    params = req["params"]
+    return {k: params[k].strip() if _is_text(params.get(k)) else None for k in ("pairId", "geminiTitle")}
+
+
+def _valid_error_result(kind: str, status: str, result: Any) -> bool:
+    if kind != "create_pair" or not isinstance(result, dict):
+        return False
+    if status == "unconfirmed":
+        return set(result) == {"pairId", "geminiTitle"} and all(v is None or _is_text(v) for v in result.values())
+    return (set(result) == {"pairId", "geminiTitle", "mayHaveUnboundChat"}
+            and _is_text(result["pairId"]) and _is_text(result["geminiTitle"])
+            and result["mayHaveUnboundChat"] is True)
+
+
+def _validate_done(done: Any, rid: str) -> dict[str, Any]:
     if (not isinstance(done, dict) or done.get("requestId") != rid or done.get("status") not in TERMINAL
             or done.get("kind") not in KINDS or not isinstance(done.get("keyHash"), str)
-            or not re.fullmatch(r"[0-9a-f]{64}", done["keyHash"])
-            or (done["status"] == "ok" and not isinstance(done.get("result"), dict))
-            or (done["status"] != "ok" and not isinstance(done.get("error"), str))):
+            or not re.fullmatch(r"[0-9a-f]{64}", done["keyHash"])):
         raise tb.BridgeError("invalid_control_request")
+    fields = {"requestId", "status", "kind", "keyHash"}
+    status, kind, result = done["status"], done["kind"], done.get("result")
+    if status != "ok":
+        if not _is_text(done.get("error")) or set(done) - fields - {"error", "result"}:
+            raise tb.BridgeError("invalid_control_request")
+        if status == "unconfirmed" and (done["error"] != "control_request_unconfirmed" or result is None):
+            raise tb.BridgeError("invalid_control_request")
+        if "result" in done and not _valid_error_result(kind, status, result):
+            raise tb.BridgeError("invalid_control_request")
+    elif set(done) != fields | {"result"}:
+        raise tb.BridgeError("invalid_control_request")
+    elif kind == "list_chats":
+        if not _valid_chat_list(result):
+            raise tb.BridgeError("invalid_control_request")
+    else:
+        if not isinstance(result, dict) or not (
+            (set(result) == {"pair", "titleMode"} and _is_text(result["titleMode"]))
+            or (set(result) == {"pair", "recovered"} and result["recovered"] is True)
+        ):
+            raise tb.BridgeError("invalid_control_request")
+        pair = result["pair"]
+        if (not isinstance(pair, dict) or not _is_text(pair.get("pairId")) or not _is_uid(pair.get("pairUid"))
+                or pair.get("controlRequestId") != rid):
+            raise tb.BridgeError("invalid_control_request")
+        tb.validate_pairs_data({"schemaVersion": 2, "pairs": {pair["pairId"]: pair}})
     return done
 
 
+def _key_for_request(root: Path, req: dict[str, Any]) -> Path:
+    return _key_path(root, req["source"]["scope"], req["idempotencyKey"])
+
+
+def _check_receipt_match(root: Path, done: dict[str, Any], req: dict[str, Any]) -> None:
+    if done["kind"] != req["kind"] or done["keyHash"] != _key_for_request(root, req).name:
+        raise tb.BridgeError("invalid_control_request")
+    if req["kind"] == "create_pair" and done["status"] == "ok":
+        if not _matches_intended_pair(done["result"]["pair"], req):
+            raise tb.BridgeError("invalid_control_request")
+    if done["status"] == "unconfirmed" and done["result"] != _request_target(req):
+        raise tb.BridgeError("invalid_control_request")
+    if done["status"] == "failed" and "result" in done and done["result"]["pairId"] != req["params"].get("pairId"):
+        raise tb.BridgeError("invalid_control_request")
+
+
+def _read_done(root: Path, rid: str, req: dict[str, Any] | None = None) -> dict[str, Any] | None:
+    try:
+        done = _validate_done(_read(_path(root, "done", rid), MAX_RESULT_BYTES), rid)
+    except FileNotFoundError:
+        return None
+    if req is not None:
+        _check_receipt_match(root, done, req)
+    return done
+
+
+def _matches_intended_pair(pair: Any, req: dict[str, Any]) -> bool:
+    return (isinstance(pair, dict) and _is_uid(req.get("pairUid")) and pair.get("pairUid") == req["pairUid"]
+            and pair.get("controlRequestId") == req["requestId"] and pair.get("pairId") == req["params"].get("pairId")
+            and pair.get("ownerScope") == req["source"]["scope"] and pair.get("createdVia") == req["source"]["via"])
+
+
+def _read_retired(root: Path, rid: str) -> dict[str, Any] | None:
+    try:
+        summary = _read(_path(root, "retired", rid), MAX_RESULT_BYTES)
+    except FileNotFoundError:
+        return None
+    if (not isinstance(summary, dict) or summary.get("requestId") != rid
+            or summary.get("kind") not in KINDS or summary.get("terminalStatus") not in TERMINAL
+            or set(summary) - {"requestId", "kind", "terminalStatus", "keyHash", "error", "result"}
+            or not isinstance(summary.get("keyHash"), str) or not re.fullmatch(r"[0-9a-f]{64}", summary["keyHash"])
+            or not _is_text(summary.get("error"))
+            or (summary["terminalStatus"] == "ok" and "result" in summary)
+            or (summary["terminalStatus"] == "unconfirmed" and "result" not in summary)
+            or ("result" in summary and not _valid_error_result(summary["kind"], summary["terminalStatus"], summary["result"]))):
+        raise tb.BridgeError("invalid_control_request")
+    return {**summary, "ok": False, "completed": True, "status": "expired"}
+
+
 def _status(root: Path, rid: str) -> dict[str, Any]:
-    done = _read_done(root, rid)
+    try:
+        flight = _read_envelope(_path(root, "in_flight", rid), rid, in_flight=True)
+    except FileNotFoundError:
+        flight = None
+    done = _read_done(root, rid, flight)
     if done is not None:
         return {**done, "ok": done["status"] == "ok", "completed": True}
+    retired = _read_retired(root, rid)
+    if retired is not None:
+        return retired
     for state in ("inbox", "in_flight"):
         try:
             _read_request(root, _path(root, state, rid), rid, in_flight=state == "in_flight")
@@ -200,15 +324,14 @@ def submit(
         previous = _read_key(key_path)
         if previous is not None:
             rid = previous["requestId"]
-            if previous.get("retired"):
-                done = _read_done(root, rid)
-                if done is not None:
-                    return {**done, "ok": done["status"] == "ok", "completed": True}
-                return {"ok": False, "completed": True, "requestId": rid, "status": "expired",
-                        "kind": previous["kind"], "terminalStatus": previous["retired"],
-                        "error": "control_request_unconfirmed"}
             _publish(root, rid)
-            return _status(root, rid)
+            status = _status(root, rid)
+            if "keyHash" in status and (status["keyHash"] != key_path.name or status["kind"] != previous["kind"]):
+                raise tb.BridgeError("invalid_control_request")
+            if status.get("terminalStatus", status["status"]) != "failed":
+                return status
+            # Delivery was confirmed failed, not ambiguous. Replace only this
+            # index entry, leaving the prior request queryable by its own ID.
         if not daemon_available(bridge, cfg):
             raise tb.BridgeError("control_plane_unavailable")
         try:
@@ -319,12 +442,12 @@ def _check_binding(bridge: tb.Bridge, pairs: dict[str, Any], spec: dict[str, Any
 
 
 def _bind(
-    pairs: dict[str, Any], spec: dict[str, Any], source: dict[str, Any], title: str, rid: str | None,
+    pairs: dict[str, Any], spec: dict[str, Any], source: dict[str, Any], title: str, rid: str | None, pair_uid: str,
 ) -> dict[str, Any]:
     pair_id, t3_thread, reply_to = spec["pairId"], spec["t3ThreadId"], spec["replyTo"]
     previous = pairs.get(pair_id, {})
     pair = {
-        "pairId": pair_id, "pairUid": uuid.uuid4().hex, "adapter": spec["adapter"],
+        "pairId": pair_id, "pairUid": pair_uid, "adapter": spec["adapter"],
         "label": spec.get("label") or pair_id, "t3ThreadId": t3_thread, "defaultReplyThreadId": reply_to,
         "allowedReplyThreadIds": sorted({t3_thread, reply_to}) if spec["adapter"] == "t3" else [],
         "geminiTitle": title, "workspacePath": spec.get("workspace"), "route": "gemini",
@@ -337,6 +460,12 @@ def _bind(
     return pair
 
 
+class PairCommitError(tb.BridgeError):
+    def __init__(self, code: str, pair_id: str, title: str) -> None:
+        super().__init__(code)
+        self.result = {"pairId": pair_id, "geminiTitle": title, "mayHaveUnboundChat": True}
+
+
 def create_pair_with_ax(
     bridge: tb.Bridge, cfg: dict[str, Any], params: dict[str, Any], probes: dict[str, Any],
     source: dict[str, Any], *, request: dict[str, Any] | None = None,
@@ -345,40 +474,68 @@ def create_pair_with_ax(
     drv, pid = _pid(bridge, probes)
     pair_id, title, adapter = spec["pairId"], spec["geminiTitle"], spec["adapter"]
     rid = request["requestId"] if request is not None else None
-    # Lock ordering: UI -> pairs -> ledger (short active-task check). Holding pairs_tx
-    # across create prevents a send/rebind from making a valid preflight stale mid-AX.
-    with tb.file_lock(bridge.root / ".gemini_ui.lock"), bridge.pairs_tx() as data:
-        if rid is None and adapter == "local":
-            bridge.require_v21_runtime_for_root(cfg)
-        _check_binding(bridge, data["pairs"], spec, source)
-        pair = _bind(data["pairs"], spec, source, title, rid)
-        if len(tb.encode_json_bytes(data)) > MAX_PAIRS_BYTES:
-            raise tb.BridgeError("file_too_large")
+    pair_uid = uuid.uuid4().hex
+    wait_s = float(spec["waitSec"])
+    with tb.file_lock(bridge.root / ".gemini_ui.lock"):
+        with tb.file_lock(bridge.root / ".pairs.lock"):
+            if rid is None and adapter == "local":
+                bridge.require_v21_runtime_for_root(cfg)
+            data = bridge.pairs()
+            pairs = data["pairs"]
+            _check_binding(bridge, pairs, spec, source)
+            expected = pairs.get(pair_id)
+            _bind(pairs, spec, source, title, rid, pair_uid)
+            if len(tb.encode_json_bytes(data)) > MAX_PAIRS_BYTES:
+                raise tb.BridgeError("file_too_large")
+
         if request is not None:
-            before = drv.list_conversations(pid)
-            if any(item.get("title") == title for item in before["conversations"]):
-                raise tb.BridgeError("gemini_init_failed:title_already_exists")
-            # Only recover by title if the daemon reached this point, with no prior
-            # exact title. A crash after claim alone does not prove who made a chat.
-            tb.atomic_json(_path(bridge.root / "control", "in_flight", rid), {**request, "axReady": True})
-        prompt = spec.get("initPrompt") or (
-            f"This is a dedicated 1-to-1 bridge task conversation (pairId={pair_id}, adapter={adapter}). "
-            f"Do not modify any files. Reply only with: READY ({title})"
-        )
-        ok, actual_title, mode_detail = drv.create_task_conversation(
-            pid=pid, target_title=title, init_prompt=prompt, workspace_path=spec.get("workspace"), wait_s=float(spec["waitSec"]),
-        )
-        if not ok:
-            raise tb.BridgeError(f"gemini_init_failed:{actual_title}")
-        pair["geminiTitle"] = normalized_title(actual_title)
-        if len(tb.encode_json_bytes(data)) > MAX_PAIRS_BYTES:
-            raise tb.BridgeError("file_too_large")
+            until = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=wait_s + 60)
+            bridge.write_health(probes, cfg, busy={"kind": "create_pair", "requestId": rid, "until": until.isoformat()})
+        try:
+            if request is not None:
+                try:
+                    before = drv.list_conversations(pid)
+                except Exception:
+                    raise tb.BridgeError("gemini_init_failed:sidebar_unreadable") from None
+                if not _valid_chat_list(before) or before.get("sidebarReadable") is not True or not before["hasWindow"]:
+                    raise tb.BridgeError("gemini_init_failed:sidebar_unreadable")
+                if any(item["title"] == title for item in before["conversations"]):
+                    raise tb.BridgeError("gemini_init_failed:title_already_exists")
+                # Recovery can recognize only the exact UID intended for this commit.
+                tb.atomic_json(_path(bridge.root / "control", "in_flight", rid), {**request, "pairUid": pair_uid})
+            prompt = spec.get("initPrompt") or (
+                f"This is a dedicated 1-to-1 bridge task conversation (pairId={pair_id}, adapter={adapter}). "
+                f"Do not modify any files. Reply only with: READY ({title})"
+            )
+            ok, actual_title, mode_detail = drv.create_task_conversation(
+                pid=pid, target_title=title, init_prompt=prompt, workspace_path=spec.get("workspace"), wait_s=wait_s,
+            )
+            if not ok:
+                raise tb.BridgeError(f"gemini_init_failed:{actual_title}")
+        finally:
+            if request is not None:
+                bridge.write_health(probes, cfg)
+
+        try:
+            actual_title = normalized_title(actual_title)
+            with bridge.pairs_tx() as data:
+                pairs = data["pairs"]
+                if pairs.get(pair_id) != expected:
+                    raise tb.BridgeError("gemini_init_failed:pair_binding_changed")
+                _check_binding(bridge, pairs, spec, source)
+                if actual_title != title:
+                    _check_binding(bridge, pairs, {**spec, "geminiTitle": actual_title}, source)
+                pair = _bind(pairs, spec, source, actual_title, rid, pair_uid)
+                if len(tb.encode_json_bytes(data)) > MAX_PAIRS_BYTES:
+                    raise tb.BridgeError("file_too_large")
+        except tb.BridgeError as exc:
+            raise PairCommitError(str(exc), pair_id, actual_title if _is_text(actual_title) else title) from None
     return {"titleMode": mode_detail, "pair": pair}
 
 
 def _finish(root: Path, path: Path, rid: str, req: dict[str, Any], status: str, **payload: Any) -> None:
     done = {"requestId": rid, "kind": req["kind"], "status": status, **payload,
-            "keyHash": _key_path(root, req["source"]["scope"], req["idempotencyKey"]).name}
+            "keyHash": _key_for_request(root, req).name}
     try:
         encoded = tb.encode_json_bytes(done)
     except (UnicodeError, ValueError):
@@ -387,33 +544,26 @@ def _finish(root: Path, path: Path, rid: str, req: dict[str, Any], status: str, 
         done.pop("result", None)
         done.update(status="failed", error="file_too_large")
         encoded = tb.encode_json_bytes(done)
+    _validate_done(done, rid)
     with tb.file_lock(root / ".queue.lock", private=True):
+        flight = _read_envelope(path, rid, in_flight=True)
+        old = {k: v for k, v in flight.items() if k not in ("axReady", "pairUid")}
+        expected = {k: v for k, v in req.items() if k not in ("axReady", "pairUid")}
+        if old != expected:
+            raise tb.BridgeError("invalid_control_request")
+        _check_receipt_match(root, done, flight)
         tb.atomic_json_bytes(_path(root, "done", rid), encoded)
-        path.unlink()
-        tb.fsync_dir(path.parent)
+        if _read_done(root, rid, flight) == done:
+            path.unlink()
+            tb.fsync_dir(path.parent)
 
 
-def _recover_pair(bridge: tb.Bridge, req: dict[str, Any], probes: dict[str, Any]) -> dict[str, Any] | None:
-    rid = req["requestId"]
-    for pair in bridge.pairs()["pairs"].values():
-        if pair.get("controlRequestId") == rid:
-            return {"pair": pair, "recovered": True}
-    if not req.get("axReady"):
-        return None
-    spec, source = _pair_spec(req["params"], req["source"]), req["source"]
-    title = spec["geminiTitle"]
-    drv, pid = _pid(bridge, probes)
-    with tb.file_lock(bridge.root / ".gemini_ui.lock"), bridge.pairs_tx() as data:
-        if any(p["geminiTitle"].strip() == title for p in data["pairs"].values()):
-            return None
-        chats = drv.list_conversations(pid)["conversations"]
-        if sum(chat.get("title") == title and chat.get("source") == "sidebar" for chat in chats) != 1:
-            return None
-        _check_binding(bridge, data["pairs"], spec, source)
-        pair = _bind(data["pairs"], spec, source, title, rid)
-        if len(tb.encode_json_bytes(data)) > MAX_PAIRS_BYTES:
-            raise tb.BridgeError("file_too_large")
-    return {"pair": pair, "recovered": True}
+def _recover_pair(bridge: tb.Bridge, req: dict[str, Any]) -> dict[str, Any] | None:
+    pid = req["params"].get("pairId")
+    pair = bridge.pairs()["pairs"].get(pid) if isinstance(pid, str) else None
+    if _matches_intended_pair(pair, req):
+        return {"pair": pair, "recovered": True}
+    return None
 
 
 def _prune(root: Path) -> None:
@@ -427,16 +577,18 @@ def _prune(root: Path) -> None:
         for index, (mtime, path) in enumerate(sorted(done, reverse=True)):
             if index < MAX_RESULTS and mtime >= cutoff:
                 continue
+            if os.path.lexists(_path(root, "in_flight", path.stem)):
+                continue
             try:
                 receipt = _read_done(root, path.stem)
                 if receipt is None:
                     continue
-                key_path = root / "keys" / receipt["keyHash"]
-                key = _read_key(key_path)
-                if key and key["requestId"] == path.stem:
-                    tb.atomic_json(key_path, {**key, "retired": receipt["status"]})
+                summary = {"requestId": path.stem, "kind": receipt["kind"], "terminalStatus": receipt["status"],
+                           "keyHash": receipt["keyHash"], "error": receipt.get("error", "control_request_unconfirmed")}
+                if receipt["status"] != "ok" and "result" in receipt:
+                    summary["result"] = receipt["result"]
+                tb.atomic_json(_path(root, "retired", path.stem), summary)
             except (tb.BridgeError, OSError):
-                # Don't delete a receipt unless its key was safely retired.
                 continue
             path.unlink()
             removed = True
@@ -473,23 +625,29 @@ def process_control(bridge: tb.Bridge, cfg: dict[str, Any], probes: dict[str, An
                 continue
             with tb.file_lock(root / ".queue.lock", private=True):
                 try:
-                    if _read_done(root, rid) is not None:
-                        path.unlink()
-                        tb.fsync_dir(path.parent)
-                        continue
-                    req = _read_request(root, path, rid, in_flight=True)
-                    if req["kind"] == "list_chats":
-                        _rename(path, _path(root, "inbox", rid))
-                        continue
+                    req = _read_envelope(path, rid, in_flight=True)
                 except (tb.BridgeError, OSError) as exc:
                     _discard(bridge, path, str(exc))
                     continue
-            try:
-                result = _recover_pair(bridge, req, probes)
-            except tb.BridgeError:
-                result = None
+                try:
+                    if _read_done(root, rid, req) is not None:
+                        path.unlink()
+                        tb.fsync_dir(path.parent)
+                        continue
+                except tb.BridgeError as exc:
+                    bridge.log("control_receipt_rejected", reason=str(exc), requestId=rid)
+                key = _read_key(_key_for_request(root, req))
+                if not key or key["requestId"] != rid or key["kind"] != req["kind"]:
+                    bridge.log("control_request_rejected", reason="invalid_control_request", requestId=rid)
+                    continue
+                if req["kind"] == "list_chats":
+                    _path(root, "done", rid).unlink(missing_ok=True)
+                    _rename(path, _path(root, "inbox", rid))
+                    continue
+            result = _recover_pair(bridge, req)
             if result is None:
-                _finish(root, path, rid, req, "unconfirmed", error="control_request_unconfirmed")
+                _finish(root, path, rid, req, "unconfirmed",
+                        error="control_request_unconfirmed", result=_request_target(req))
             else:
                 _finish(root, path, rid, req, "ok", result=result)
 
@@ -503,8 +661,15 @@ def process_control(bridge: tb.Bridge, cfg: dict[str, Any], probes: dict[str, An
         with tb.file_lock(root / ".queue.lock", private=True):
             try:
                 req = _read_request(root, queued, rid)
-                if _read_done(root, rid) is not None:
-                    queued.unlink()
+                try:
+                    if _read_done(root, rid, req) is not None:
+                        queued.unlink()
+                        continue
+                except tb.BridgeError:
+                    # A bad receipt never suppresses an unrelated inbox request.
+                    # An existing receipt with an unverifiable outcome also must
+                    # not cause a second create, so leave the entry untouched.
+                    bridge.log("control_receipt_rejected", requestId=rid)
                     continue
                 if req["kind"] == "create_pair" and created:
                     continue
@@ -528,6 +693,8 @@ def process_control(bridge: tb.Bridge, cfg: dict[str, Any], probes: dict[str, An
                 result = create_pair_with_ax(bridge, cfg, req["params"], probes, req["source"], request=req)
             else:
                 result = list_chats_with_ax(bridge, probes)
+        except PairCommitError as exc:
+            _finish(root, path, rid, req, "failed", error=str(exc), result=exc.result)
         except tb.BridgeError as exc:
             _finish(root, path, rid, req, "failed", error=str(exc))
         else:
@@ -580,7 +747,11 @@ def run_cli(bridge: tb.Bridge, cfg: dict[str, Any], args: Any) -> int:
             return _cli_result(status, no_wait=no_wait, flatten=True)
 
     probes = bridge.system_probes()
-    result = ({"ok": True, **create_pair_with_ax(bridge, cfg, params, probes, source)}
-              if kind == "create_pair" else list_chats_with_ax(bridge, probes))
+    try:
+        result = ({"ok": True, **create_pair_with_ax(bridge, cfg, params, probes, source)}
+                  if kind == "create_pair" else list_chats_with_ax(bridge, probes))
+    except PairCommitError as exc:
+        return _cli_result({"ok": False, "completed": True, "status": "failed",
+                            "error": str(exc), "result": exc.result})
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0

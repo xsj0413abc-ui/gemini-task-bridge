@@ -123,7 +123,7 @@ class McpScope:
         pair = pairs_data["pairs"].get(pair_id)
         if not self.pair_allowed(pair_id, pair):
             return False, None
-        if pair.get("pairUid") != pair_uid:
+        if pair.get("pairUid") != pair_uid or tb.pair_adapter(pair) != adapter:
             return False, None
         return True, pair_id
 
@@ -353,7 +353,17 @@ class McpStdioServer:
     def _tool_pairs(self) -> tuple[bool, dict[str, Any]]:
         cfg = self.bridge.config()
         pairs_data = self.bridge.pairs()
-        in_flight = self.bridge._active_in_flight_by_pair()
+        with tb.file_lock(self.bridge.root / ".ledger.lock"):
+            ledger = self.bridge.ledger()
+        in_flight = {}
+        for tid, dispatch in ledger["dispatches"].items():
+            if not isinstance(dispatch, dict) or dispatch.get("status") not in (
+                "dispatching", "in_flight", "needs_attention", "captured_to_outbox",
+            ):
+                continue
+            allowed, pid = self.scope.authorize_task(tid, pairs_data, ledger)
+            if allowed:
+                in_flight.setdefault(pid, tid)
         out = []
         for pid, p in sorted(pairs_data["pairs"].items()):
             if not self.scope.pair_allowed(pid, p):
@@ -569,6 +579,8 @@ class McpStdioServer:
         if not status["completed"]:
             return False, out
         if not status["ok"]:
+            if status.get("kind") == kind and "result" in status:
+                out["result"] = status["result"]
             return True, out
         if status["kind"] != kind:
             raise tb.BridgeError("invalid_control_request")

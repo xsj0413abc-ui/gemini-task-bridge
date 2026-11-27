@@ -182,30 +182,47 @@ class ControlPlaneTests(unittest.TestCase):
         self.assertEqual(self._result(rid)["status"], "pending")
         self.assertEqual(self.daemon.pairs()["pairs"], {})
 
-    def test_recovery_binds_exact_sidebar_title_after_ax_before_commit(self):
+    def test_recovery_after_ax_before_commit_is_unconfirmed_even_with_exact_title(self):
         rid = self._submit()
         self._crash_after_ax(rid)
         restarted = tb.Bridge(root=self.root, ax_driver=self.ax)
-        restarted.scan(recover=True)
+        with mock.patch.object(self.ax, "list_conversations", side_effect=AssertionError("recovery AX")):
+            restarted.scan(recover=True)
         got = self._result(rid)
-        self.assertEqual(got["status"], "ok")
-        self.assertTrue(got["result"]["recovered"])
-        self.assertEqual(got["result"]["pair"]["ownerScope"], "codex")
-        self.assertEqual(got["result"]["pair"]["controlRequestId"], rid)
-        self.assertEqual(len(self.ax.injected_prompts), 1)
-
-    def test_recovery_unconfirmed_when_exact_title_absent(self):
-        rid = self._submit()
-        self._crash_after_ax(rid)
-        self.ax.conversations.clear()
-        self.ax.add_conv("Title one suffix")
-        self.daemon.scan(recover=True)
-        self.assertEqual(self._result(rid)["status"], "unconfirmed")
-        self.assertEqual(self._result(rid)["error"], "control_request_unconfirmed")
+        self.assertEqual(got["status"], "unconfirmed")
+        self.assertEqual(got["error"], "control_request_unconfirmed")
+        self.assertEqual(got["result"], {"pairId": "one", "geminiTitle": "Title one"})
         self.assertEqual(self._submit(), rid)
-        self.daemon.scan(recover=True)
         self.assertEqual(self.daemon.pairs()["pairs"], {})
         self.assertEqual(len(self.ax.injected_prompts), 1)
+        server = self._server("codex")
+        failed, replay = self._call(server, "gemini_pair_init", title="Title one", idempotency_key="key")
+        self.assertTrue(failed)
+        self.assertEqual(replay["result"], got["result"])
+
+    def test_recovery_does_not_restore_removed_pair_or_overwrite_rebinding(self):
+        for rebind in (False, True):
+            with self.subTest(rebind=rebind):
+                pid = f"pair-{rebind}"
+                rid = self._submit(pid, key=pid)
+                with mock.patch.object(cp, "_finish", side_effect=SystemExit):
+                    with self.assertRaises(SystemExit):
+                        self.daemon.scan()
+                with self.daemon.pairs_tx() as pairs:
+                    previous = pairs["pairs"].pop(pid)
+                    if rebind:
+                        # Even a matching controlRequestId cannot authorize a different UID.
+                        pairs["pairs"][pid] = {**previous, "pairUid": tb.uuid.uuid4().hex,
+                                               "geminiTitle": f"{pid} replacement"}
+                with mock.patch.object(self.ax, "list_conversations", side_effect=AssertionError("recovery AX")):
+                    self.daemon.scan(recover=True)
+                self.assertEqual(self._result(rid)["status"], "unconfirmed")
+                pair = self.daemon.pairs()["pairs"].get(pid)
+                if rebind:
+                    self.assertEqual(pair["geminiTitle"], f"{pid} replacement")
+                else:
+                    self.assertIsNone(pair)
+        self.assertEqual(len(self.ax.injected_prompts), 2)
 
     def test_claim_without_ax_intent_does_not_bind_preexisting_title(self):
         rid = self._submit()
@@ -243,6 +260,145 @@ class ControlPlaneTests(unittest.TestCase):
         self.daemon.scan(recover=True)
         self.assertEqual(self._result(second), receipt)
         self.assertFalse(flight.exists())
+
+    def test_mismatched_receipt_cannot_finalize_in_flight(self):
+        rid = self._submit()
+        with mock.patch.object(cp, "_finish", side_effect=SystemExit):
+            with self.assertRaises(SystemExit):
+                self.daemon.scan()
+        pair = self.daemon.pairs()["pairs"]["one"]
+        done = self.control / "done" / f"{rid}.json"
+        receipt = {"requestId": rid, "keyHash": cp._key_path(self.control, "codex", "key").name,
+                   "kind": "create_pair", "status": "ok",
+                   "result": {"pair": {**pair, "pairUid": tb.uuid.uuid4().hex}, "recovered": True}}
+        tb.atomic_json(done, receipt)
+        with self.assertRaisesRegex(tb.BridgeError, "invalid_control_request"):
+            self._result(rid)
+        self.assertTrue((self.control / "in_flight" / f"{rid}.json").exists())
+        self.daemon.scan(recover=True)
+        self.assertEqual(self._result(rid)["result"]["pair"]["pairUid"], pair["pairUid"])
+        self.assertEqual(len(self.ax.injected_prompts), 1)
+
+    def test_receipt_schema_rejects_unexpected_status_fields(self):
+        for kind, state, payload in (
+            ("list_chats", "ok", {"result": {}}),
+            ("list_chats", "unconfirmed", {"error": "control_request_unconfirmed", "result": {
+                "pairId": "x", "geminiTitle": "Name",
+            }}),
+            ("create_pair", "failed", {"error": "gemini_not_running", "completed": True}),
+            ("create_pair", "ok", {"result": {"pair": {}}}),
+        ):
+            with self.subTest(kind=kind, status=state):
+                rid = tb.uuid.uuid4().hex
+                tb.atomic_json(self.control / "done" / f"{rid}.json",
+                               {"requestId": rid, "keyHash": "c" * 64, "kind": kind, "status": state, **payload})
+                with self.assertRaisesRegex(tb.BridgeError, "invalid_control_request"):
+                    self._result(rid)
+
+    def test_sidebar_unavailable_or_unreadable_fails_before_create(self):
+        for name, side_effect in (
+            ("missing", lambda _: {"hasWindow": False, "currentTitle": None, "conversations": []}),
+            ("rows", lambda _: {"hasWindow": True, "sidebarReadable": False, "currentTitle": None, "conversations": []}),
+            ("exception", OSError("AX read failed")),
+        ):
+            rid = self._submit(key=name)
+            with mock.patch.object(self.ax, "list_conversations", side_effect=side_effect):
+                self.daemon.scan()
+            self.assertEqual(self._result(rid)["error"], "gemini_init_failed:sidebar_unreadable")
+        self.assertEqual(self.ax.injected_prompts, [])
+        rid = self._submit(key="valid-empty")
+        self.daemon.scan()
+        self.assertTrue(self._result(rid)["ok"])
+
+    def test_create_releases_pairs_lock_and_does_not_overwrite_concurrent_edits(self):
+        create = self.ax.create_task_conversation
+
+        def raced(**kwargs):
+            with tb.file_lock(self.root / ".pairs.lock", nonblocking=True):
+                pass
+            self._seed_pair("one")
+            return create(**kwargs)
+
+        rid = self._submit(title="Fresh")
+        with mock.patch.object(self.ax, "create_task_conversation", side_effect=raced):
+            self.daemon.scan()
+        pair = self.daemon.pairs()["pairs"]["one"]
+        self.assertEqual(pair["geminiTitle"], "Title one")
+        got = self._result(rid)
+        self.assertEqual(got["status"], "failed")
+        self.assertEqual(got["result"], {"pairId": "one", "geminiTitle": "Fresh", "mayHaveUnboundChat": True})
+
+    def test_create_rechecks_title_after_ax(self):
+        create = self.ax.create_task_conversation
+
+        def raced(**kwargs):
+            pair = self._seed_pair("other")
+            create(**{**kwargs, "target_title": pair["geminiTitle"]})
+            return True, pair["geminiTitle"], "auto_titled"
+
+        rid = self._submit(title="Original title")
+        with mock.patch.object(self.ax, "create_task_conversation", side_effect=raced):
+            self.daemon.scan()
+        self.assertEqual(self._result(rid)["error"], "duplicate_gemini_title_in_pairs")
+        self.assertEqual(self._result(rid)["result"]["geminiTitle"], "Title other")
+        self.assertNotIn("one", self.daemon.pairs()["pairs"])
+
+    def test_busy_health_extends_both_gates_only_until_deadline(self):
+        rid = self._submit()
+        create = self.ax.create_task_conversation
+        now = datetime.datetime.now(datetime.timezone.utc)
+
+        def busy(**kwargs):
+            report = self.daemon.read_health()
+            self.assertEqual(report["busy"]["requestId"], rid)
+            self.assertEqual(report["busy"]["kind"], "create_pair")
+            self.assertAlmostEqual((tb.parse_iso_utc(report["busy"]["until"]) - now).total_seconds(), 63, delta=2)
+            report["lastScanAt"] = (now - datetime.timedelta(seconds=20)).isoformat()
+            tb.atomic_json(self.root / ".daemon_health.json", report)
+            self.assertTrue(cp.daemon_available(self.client, self.cfg))
+            self.assertEqual(self.client.check_v21_runtime_for_root(self.cfg), (True, "live_v21_daemon"))
+            report["busy"]["until"] = (now - datetime.timedelta(seconds=1)).isoformat()
+            tb.atomic_json(self.root / ".daemon_health.json", report)
+            self.assertFalse(cp.daemon_available(self.client, self.cfg))
+            self.assertFalse(self.client.check_v21_runtime_for_root(self.cfg)[0])
+            return create(**kwargs)
+
+        with tb.file_lock(self.root / ".process.lock") as fd:
+            os.write(fd, str(os.getpid()).encode("ascii"))
+            with mock.patch.object(self.ax, "create_task_conversation", side_effect=busy):
+                self.daemon.scan()
+        self.assertTrue(self._result(rid)["ok"])
+        self.assertNotIn("busy", self.daemon.read_health())
+
+    def test_same_key_retries_failed_attempt_and_keeps_attempt_history(self):
+        server = self._server("codex")
+        self.ax.gemini_running = False
+        with mock.patch.object(cp, "wait_for_request", wraps=self._daemon_wait):
+            error, failed = self._call(server, "gemini_pair_init", title="Retry title")
+            self.ax.gemini_running = True
+            error2, done = self._call(server, "gemini_pair_init", title="Retry title")
+            error3, replay = self._call(server, "gemini_pair_init", title="Retry title")
+        self.assertTrue(error)
+        self.assertEqual(failed["error"], "gemini_not_running")
+        self.assertFalse(error2 or error3)
+        self.assertNotEqual(failed["requestId"], done["requestId"])
+        self.assertEqual(replay["requestId"], done["requestId"])
+        self.assertEqual(self._result(failed["requestId"])["status"], "failed")
+        self.assertEqual(len(self.ax.injected_prompts), 1)
+
+    def test_pair_add_preserves_metadata_only_for_same_uid(self):
+        rid = self._submit()
+        self.daemon.scan()
+        old = self._result(rid)["result"]["pair"]
+        rc, updated = self._cli("add", "--id", "one", "--adapter", "local",
+                                "--gemini-title", "Title one", "--label", "Updated")
+        self.assertEqual(rc, 0)
+        for field in ("pairUid", "ownerScope", "createdVia", "controlRequestId"):
+            self.assertEqual(updated["pair"][field], old[field])
+        rc, rebound = self._cli("add", "--id", "one", "--adapter", "local", "--gemini-title", "Rebound")
+        self.assertEqual(rc, 0)
+        self.assertNotEqual(rebound["pair"]["pairUid"], old["pairUid"])
+        self.assertTrue(set(rebound["pair"]).isdisjoint({"controlRequestId", "createdVia", "ownerScope"}))
 
     def test_list_recovery_and_all_lists_per_scan(self):
         ids = [cp.submit(self.client, self.cfg, "list_chats", {}, via="cli")["requestId"] for _ in range(3)]
@@ -294,6 +450,20 @@ class ControlPlaneTests(unittest.TestCase):
         self.assertEqual(self.daemon.pairs()["pairs"]["mine"], mine)
         self.assertEqual({p["pairId"] for p in self._call(self._server(None), "gemini_pairs")[1]["pairs"]},
                          {"mine", "other", "allow", "legacy"})
+
+    def test_mcp_pair_summary_filters_stale_uid_and_adapter_before_selecting_task(self):
+        pair = self._seed_pair("mine", scope="codex")
+        server = self._server("codex", adapter_filter="all")
+        with self.daemon.ledger_tx() as ledger:
+            base = {"pairId": "mine", "pairUid": pair["pairUid"], "status": "in_flight", "adapter": "local"}
+            ledger["dispatches"].update(old={**base, "pairUid": tb.uuid.uuid4().hex},
+                                        wrong_adapter={**base, "adapter": "t3"})
+        _, out = self._call(server, "gemini_pairs")
+        self.assertIsNone(out["pairs"][0]["inFlightTaskId"])
+        with self.daemon.ledger_tx() as ledger:
+            ledger["dispatches"]["valid"] = base
+        _, out = self._call(server, "gemini_pairs")
+        self.assertEqual(out["pairs"][0]["inFlightTaskId"], "valid")
 
     def test_mcp_send_rechecks_owner_under_pair_lock(self):
         self._seed_pair("mine", scope="codex")
@@ -462,6 +632,24 @@ class ControlPlaneTests(unittest.TestCase):
         self.assertFalse((self.control / "done" / f"{ids[0]}.json").exists())
         self.assertEqual({p.stem for p in (self.control / "done").glob("*.json")}, set(ids[1:]))
 
+    def test_pruned_failed_request_still_allows_same_key_retry(self):
+        rid = self._submit()
+        self.ax.gemini_running = False
+        self.daemon.scan()
+        old = time.time() - cp.RETENTION_SECONDS - 10
+        os.utime(self.control / "done" / f"{rid}.json", (old, old))
+        self.ax.gemini_running = True
+        self.daemon.scan()
+        summary = self._result(rid)
+        self.assertEqual((summary["status"], summary["terminalStatus"], summary["error"]),
+                         ("expired", "failed", "gemini_not_running"))
+        retry = self._submit()
+        self.assertNotEqual(rid, retry)
+        self.daemon.scan()
+        self.assertTrue(self._result(retry)["ok"])
+        self.assertEqual(self._result(rid), summary)
+        self.assertEqual(len(self.ax.injected_prompts), 1)
+
     def test_retention_preserves_idempotency_tombstone(self):
         rid = self._submit()
         self.daemon.scan()
@@ -473,6 +661,7 @@ class ControlPlaneTests(unittest.TestCase):
         self.assertEqual(self._submit(), rid)
         status = cp.submit(self.client, self.cfg, "create_pair", {}, via="mcp", scope="codex", idempotency_key="key")
         self.assertEqual((status["status"], status["terminalStatus"]), ("expired", "ok"))
+        self.assertEqual(self._result(rid), status)
         self.daemon.scan()
         self.assertEqual(len(self.ax.injected_prompts), 1)
 

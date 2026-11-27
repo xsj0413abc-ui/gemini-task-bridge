@@ -717,16 +717,16 @@ class MacOSAXBridge:
                 time.sleep(0.05)
         return None
 
-    def _iter_sidebar_buttons(self, outline_el: int) -> list[tuple[int, dict[str, Any]]]:
-        """Return retained (AXButton, parsed_label) list for sidebar conversation items."""
+    def _iter_sidebar_buttons(self, outline_el: int) -> list[tuple[int, dict[str, Any]]] | None:
+        """Return retained buttons, or None when AX did not expose readable rows."""
         rows_ref = self._copy_attr(outline_el, "AXRows") or self._copy_attr(outline_el, "AXChildren")
         if not rows_ref:
-            return []
+            return None
         results: list[tuple[int, dict[str, Any]]] = []
         seen_filter = False
         try:
             if self.cf.CFGetTypeID(rows_ref) != self.cf.CFArrayGetTypeID():
-                return []
+                return None
             cnt = int(self.cf.CFArrayGetCount(rows_ref))
             for i in range(cnt):
                 row = int(self.cf.CFArrayGetValueAtIndex(rows_ref, i))
@@ -805,6 +805,7 @@ class MacOSAXBridge:
         try:
             win = self._find_main_window(app_el)
             current_title = None
+            sidebar_readable = False
             items: list[dict[str, Any]] = []
             seen_titles: set[str] = set()
             if win is not None:
@@ -814,6 +815,8 @@ class MacOSAXBridge:
                     if outline is not None:
                         try:
                             btns = self._iter_sidebar_buttons(outline)
+                            sidebar_readable = btns is not None
+                            btns = btns or []
                             try:
                                 for _btn, parsed in btns:
                                     t = parsed["title"]
@@ -836,6 +839,7 @@ class MacOSAXBridge:
 
             return {
                 "hasWindow": win is not None,
+                "sidebarReadable": sidebar_readable,
                 "currentTitle": current_title,
                 "conversations": items,
             }
@@ -1028,7 +1032,7 @@ class MacOSAXBridge:
                 outline = self._ensure_sidebar_open(pid, win)
                 if outline is not None:
                     try:
-                        btns = self._iter_sidebar_buttons(outline)
+                        btns = self._iter_sidebar_buttons(outline) or []
                         try:
                             for btn, parsed in btns:
                                 if parsed["title"] == target:
@@ -1557,7 +1561,7 @@ class MacOSAXBridge:
                     return False, current_title
                 target_btn = None
                 try:
-                    btns = self._iter_sidebar_buttons(outline)
+                    btns = self._iter_sidebar_buttons(outline) or []
                     try:
                         for btn, parsed in btns:
                             if parsed["title"] == current_title:
