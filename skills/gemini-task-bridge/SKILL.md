@@ -36,27 +36,20 @@ Run this decision tree first so you can guide any user from not installed to a c
 
 ---
 
-## Workflow 1 — Manual Setup & Host Registration (v2.2.0)
+## Workflow 1 — Install and Verify the Bridge
 
-> Execute these steps for the user. Only step 2 needs the user's hands (one toggle in System Settings).
+Run these steps for the user.
 
-1. **Install scripts & CLI** (atomic; preserves `pairs.json`, `bridge_config.json`, `ledger.json`):
+1. From the skill directory, install the CLI and LaunchAgent and set up PATH:
    ```bash
-   bash scripts/install.sh
+   bash scripts/install.sh --install-service --add-to-path
    ```
-   Add `export PATH="$HOME/.local/bin:$PATH"` to `~/.zshrc` if `~/.local/bin` is not in `PATH`.
-2. **Grant Accessibility to `Python.app` (not `/usr/bin/python3`)**:
-   Enable the exact single-link `TCC Python` path printed by `install.sh` in **System Settings → Privacy & Security → Accessibility** (plus **Full Disk Access** for workspaces in `~/Desktop`, `~/Documents`, `~/Downloads`).
-3. **Install & verify the LaunchAgent**:
-   ```bash
-   gemini-task-bridge service install
-   gemini-task-bridge doctor
-   ```
-   For `conflicting_launchagent_for_root` or upgrading an active `v2.0` T3 daemon, see [references/macos-permissions-and-troubleshooting.md](references/macos-permissions-and-troubleshooting.md).
-4. **Register scoped MCP in the host** (tell the user to **start a new session** afterward):
-   - Claude Code: `claude mcp add --transport stdio --scope user gemini-task-bridge -- "$HOME/.local/bin/gemini-task-bridge" mcp --scope claude-code`
-   - Codex: `codex mcp add gemini-task-bridge -- "$HOME/.local/bin/gemini-task-bridge" mcp --scope codex`
-   - Antigravity: add `"gemini-task-bridge"` with absolute binary path and `["mcp", "--scope", "antigravity"]` to `~/.gemini/config/mcp_config.json`.
+2. In **System Settings → Privacy & Security → Accessibility**, ask the user to enable the `Python.app` selected in Finder (add it if it is not listed). If the installer didn't open Settings and Accessibility is needed, use its printed TCC Python path to locate the app. Poll `"$HOME/.local/bin/gemini-task-bridge" doctor --json` every few seconds until `ready: true`. If blocked, follow `next` (for example, restart the service if the toggle is on but the daemon still lacks trust). For LaunchAgent conflicts or upgrades, see [macOS troubleshooting](references/macos-permissions-and-troubleshooting.md).
+3. Register MCP for the user's host with the absolute wrapper path:
+   - **Claude Code** — run `env -u CLAUDE_CONFIG_DIR claude mcp add --transport stdio --scope user gemini-task-bridge -- "$HOME/.local/bin/gemini-task-bridge" mcp --scope claude-code` for the default config. Repeat with `CLAUDE_CONFIG_DIR` set to each custom config directory the user uses.
+   - **Codex** — run `codex mcp add gemini-task-bridge -- "$HOME/.local/bin/gemini-task-bridge" mcp --scope codex`.
+   - **Antigravity** — back up `~/.gemini/config/mcp_config.json` if it exists, then parse it (treat a missing or empty file as `{}`). Merge only the `gemini-task-bridge` entry into `mcpServers`, with `command` set to the absolute wrapper path and `args` set to `["mcp", "--scope", "antigravity"]`. Preserve all other entries and keys.
+4. Ask the user to start a new host session. In it, call `gemini_pair_init` with a unique test title, use `gemini_send` to ask Gemini to echo a random code, then use `gemini_wait` to verify the reply contains that exact code.
 
 ---
 

@@ -14,59 +14,41 @@
 
 > **最省事的用法：** 装好技能后，直接对你的 AI（Claude Code、Codex 或 Antigravity）说「帮我安装并配置 gemini-task-bridge」。它会按 `SKILL.md` 替你执行下面每一步，你只需要在「系统设置 → 隐私与安全性 → 辅助功能」里打开 `Python.app` 的开关。
 
-### 1. 安装桥接脚本与命令行
+### 1. 安装命令行和后台服务
 
 ```bash
 git clone https://github.com/xsj0413abc-ui/gemini-task-bridge.git
 cd gemini-task-bridge
-bash skills/gemini-task-bridge/scripts/install.sh
+bash skills/gemini-task-bridge/scripts/install.sh --install-service --add-to-path
 ```
 
-如果 `~/.local/bin` 不在 `PATH` 中，将其加入 `~/.zshrc` 并重新加载终端：
+如有需要，安装脚本会备份已有的 `~/.zshrc`，并把 `~/.local/bin` 加入新 zsh 会话的 PATH。
 
-```bash
-export PATH="$HOME/.local/bin:$PATH"
-```
+### 2. 打开辅助功能开关并检查是否就绪
 
-### 2. 给 `Python.app` 开启辅助功能权限
+在 **系统设置 → 隐私与安全性 → 辅助功能** 中启用访达里选中的 `Python.app`（如果列表里没有，先添加）。如果设置没有自动弹出，用安装脚本打印的 TCC Python 路径找到该应用。
 
-`install.sh` 会打印解析出的单硬链接 `TCC Python` 路径（`.../Python.app/Contents/MacOS/Python`）：
+每隔几秒运行 `"$HOME/.local/bin/gemini-task-bridge" doctor --json`，直到 `ready: true`。如果未就绪，按 `next` 处理，例如重启服务或打开 `Gemini.app`。
 
-1. 打开 **系统设置 → 隐私与安全性 → 辅助功能**，添加并启用该 `Python.app`（不要选 `/usr/bin/python3`）。
-2. 如果你的工作目录在 `~/Desktop`、`~/Documents` 或 `~/Downloads`，在 **完全磁盘访问权限** 中一并启用该 `Python.app`。
+### 3. 在 AI 宿主中注册 MCP
 
-### 3. 安装并体检后台服务
-
-```bash
-gemini-task-bridge service install
-gemini-task-bridge doctor
-```
-
-`doctor` 会按 `daemon → daemon_accessibility → screen → gemini` 顺序逐项检查，若未就绪会直接告诉你卡在哪一步和下一条命令。确认 **Gemini.app** 已打开且全部通过（`doctor --json` 中 `ready: true`）。
-
-### 4. 在宿主中注册 MCP（以及可选的 Skill）
-
-注册 stdio MCP 时带上 `--scope <宿主名>`，每个宿主只看到自己创建的配对，且各自拥有最多 10 个 AI 自动建对话的配额：
-
-- **Claude Code：**
+- **Claude Code**（默认配置）
   ```bash
-  claude mcp add --transport stdio --scope user gemini-task-bridge -- \
+  env -u CLAUDE_CONFIG_DIR claude mcp add --transport stdio --scope user gemini-task-bridge -- \
     "$HOME/.local/bin/gemini-task-bridge" mcp --scope claude-code
   ```
-- **Codex：**
+  每个正在使用的自定义配置目录也要执行一次，把 `env -u CLAUDE_CONFIG_DIR` 替换为 `CLAUDE_CONFIG_DIR="/配置目录的绝对路径"`。
+- **Codex**
   ```bash
   codex mcp add gemini-task-bridge -- \
     "$HOME/.local/bin/gemini-task-bridge" mcp --scope codex
   ```
-- **Antigravity（`~/.gemini/config/mcp_config.json`）：**
-  把 `<ABS_PATH_TO_BIN>` 替换为 `dirname "$(command -v gemini-task-bridge)"` 的实际绝对路径（JSON 里不要写未展开的 `$HOME`）：
+- **Antigravity** — 如果 `~/.gemini/config/mcp_config.json` 已存在，先备份。文件不存在或为空时按 `{}` 处理，只把下面这一项合并到 `mcpServers`。保留其他所有条目和字段，使用实际绝对路径，不要在 JSON 里写字面的 `$HOME`。
   ```json
   {
-    "mcpServers": {
-      "gemini-task-bridge": {
-        "command": "<ABS_PATH_TO_BIN>/gemini-task-bridge",
-        "args": ["mcp", "--scope", "antigravity"]
-      }
+    "gemini-task-bridge": {
+      "command": "<ABS_PATH_TO_BIN>/gemini-task-bridge",
+      "args": ["mcp", "--scope", "antigravity"]
     }
   }
   ```
@@ -84,13 +66,9 @@ npx skills add xsj0413abc-ui/gemini-task-bridge
 /plugin install gemini-task-bridge@gemini-task-bridge
 ```
 
-### 5. 新开会话，跑通第一单
+### 4. 新开会话并验证回包
 
-在你的 AI 宿主里**新开一个会话**，直接让它新建 Gemini 对话并派发任务，例如：
-
-> 「用 gemini-task-bridge 新建一个叫 `Code Reviewer` 的 Gemini Task 对话，请它审阅 `/abs/path/to/spec.md`。」
-
-AI 会自动调用 `gemini_pair_init`（由后台服务代建，宿主无需辅助功能权限），接着执行 `gemini_send` → `gemini_wait` → `gemini_read`。
+在 AI 宿主里新开一个会话。让 AI 用 `gemini_pair_init` 建一个名称唯一的测试对话，用 `gemini_send` 请 Gemini 原样复述一段随机口令，再用 `gemini_wait` 核对回包里的口令是否完全一致。
 
 ---
 

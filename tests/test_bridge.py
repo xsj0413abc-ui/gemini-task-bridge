@@ -701,6 +701,29 @@ class BridgeUnitTests(unittest.TestCase):
         after = json.loads(pairs_file.read_text(encoding="utf-8"))
         self.assertIn("keep_me", after["pairs"])
 
+    def test_install_add_to_path_backs_up_zshrc_and_does_not_duplicate(self) -> None:
+        rc = self.tmp / ".zshrc"
+        original = b"# Existing settings"
+        rc.write_bytes(original)
+        backup = self.tmp / ".zshrc.gemini-task-bridge.bak"
+        env = {
+            **os.environ,
+            **OFFLINE_ENV,
+            "HOME": str(self.tmp),
+            "PATH": "/usr/bin:/bin",
+            "GEMINI_TASK_BRIDGE_ROOT": str(self.root),
+        }
+        cmd = [
+            "bash", str(SCRIPTS_DIR / "install.sh"), "--label", "io.test.bridge",
+            "--add-to-path", "--no-open",
+        ]
+        expected = original + b'\nexport PATH="$HOME/.local/bin:$PATH"\n'
+        for _ in range(2):
+            result = subprocess.run(cmd, env=env, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+            self.assertEqual(rc.read_bytes(), expected)
+            self.assertEqual(backup.read_bytes(), original)
+
     def test_26_invalid_launchagent_label_rejected(self) -> None:
         for bad_label in ("../evil", "bad/label", "", ".hidden", "has space"):
             with self.assertRaises(tb.BridgeError) as cm:
