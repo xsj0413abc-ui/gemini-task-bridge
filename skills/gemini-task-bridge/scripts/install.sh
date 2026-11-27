@@ -57,7 +57,7 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-SCRIPTS=(control_plane.py gemini_task_bridge.py bridge_ax.py mcp_server.py)
+SCRIPTS=(error_catalog.py control_plane.py gemini_task_bridge.py bridge_ax.py mcp_server.py)
 for f in "${SCRIPTS[@]}"; do
   if [[ ! -f "$SCRIPT_DIR/$f" ]]; then
     echo "Error: bundled bridge script not found: $SCRIPT_DIR/$f" >&2

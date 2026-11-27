@@ -18,6 +18,7 @@ if str(SCRIPT_DIR) not in sys.path:
 
 import gemini_task_bridge as tb  # noqa: E402
 import control_plane as cp  # noqa: E402
+import error_catalog as ec  # noqa: E402
 
 SUPPORTED_VERSIONS = ("2025-06-18", "2025-03-26", "2024-11-05")
 MAX_MCP_LINE_BYTES = 512 * 1024
@@ -216,6 +217,13 @@ TOOL_SPECS: list[dict[str, Any]] = [
 TOOLS_BY_NAME: dict[str, dict[str, Any]] = {spec["name"]: spec for spec in TOOL_SPECS}
 
 
+ARG_ALIASES: dict[str, str] = {
+    "pairId": "pair_id",
+    "taskId": "task_id",
+    "idempotencyKey": "idempotency_key",
+}
+
+
 def _validate_tool_args(tool_name: str, raw_args: Any) -> dict[str, Any]:
     if tool_name not in TOOLS_BY_NAME:
         raise JsonRpcError(-32602, f"Unknown tool: {tool_name}")
@@ -228,6 +236,14 @@ def _validate_tool_args(tool_name: str, raw_args: Any) -> dict[str, Any]:
 
     schema = TOOLS_BY_NAME[tool_name]["inputSchema"]
     props = schema["properties"]
+    normalized: dict[str, Any] = {}
+    for key, val in args.items():
+        mapped = ARG_ALIASES.get(key)
+        target = mapped if mapped is not None and mapped in props else key
+        if target in normalized:
+            raise JsonRpcError(-32602, f"Duplicate argument: {key}")
+        normalized[target] = val
+    args = normalized
     required = schema.get("required", [])
     for key in args:
         if key not in props:
@@ -295,6 +311,9 @@ class McpStdioServer:
         return {"jsonrpc": "2.0", "id": req_id, "error": err}
 
     def _format_tool_result(self, payload: dict[str, Any], is_error: bool) -> dict[str, Any]:
+        if payload.get("ok") is False and isinstance(payload.get("error"), str):
+            desc = ec.describe(payload["error"])
+            payload = {**payload, **{k: v for k, v in desc.items() if k not in payload}}
         res: dict[str, Any] = {
             "content": [{"type": "text", "text": json.dumps(payload, ensure_ascii=False)}],
             "isError": is_error,
