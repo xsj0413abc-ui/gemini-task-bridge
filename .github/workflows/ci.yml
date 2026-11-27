@@ -78,6 +78,8 @@ jobs:
 
       - name: Run pure-stdlib unit and MCP subprocess tests on Python 3.9
         run: |
+          # Test fixtures spawn fake CLIs with a macOS-style `#!/usr/bin/python3` shebang.
+          ln -sf "$(command -v python3)" /usr/bin/python3
           python --version
           python -B -m unittest discover -s tests -v
 
