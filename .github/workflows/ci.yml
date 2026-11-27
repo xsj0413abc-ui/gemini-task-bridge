@@ -68,19 +68,29 @@ jobs:
             exit 1
           fi
 
-  python-39-stdlib-smoke:
-    strategy:
-      matrix:
-        os: [ubuntu-latest, macos-latest]
-    runs-on: ${{ matrix.os }}
+  python-39-stdlib-smoke-linux:
+    # actions/setup-python no longer ships 3.9 for current runners; use the official 3.9 image.
+    runs-on: ubuntu-latest
+    container: python:3.9-slim
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up Python 3.9 (zero third-party packages)
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.9"
-
       - name: Run pure-stdlib unit and MCP subprocess tests on Python 3.9
-        run: python -B -m unittest discover -s tests -v
+        run: |
+          # Test fixtures spawn fake CLIs with a macOS-style `#!/usr/bin/python3` shebang.
+          ln -sf "$(command -v python3)" /usr/bin/python3
+          python --version
+          python -B -m unittest discover -s tests -v
+
+  python-39-stdlib-smoke-macos-system:
+    # The Python users actually run: macOS /usr/bin/python3 (Command Line Tools / Xcode, 3.9.x).
+    runs-on: macos-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Run tests with macOS system Python
+        run: |
+          /usr/bin/python3 --version
+          /usr/bin/python3 -B -m unittest discover -s tests -v
