@@ -36,6 +36,7 @@ if str(SCRIPT.parent) not in sys.path:
     sys.path.insert(0, str(SCRIPT.parent))
 
 import bridge_ax  # noqa: E402
+import error_catalog  # noqa: E402
 
 BRIDGE_VERSION = "2.2.0"
 BRIDGE_CAPABILITIES = ("local_adapter", "task_reservations", "sent_payload_store", "daemon_control_plane")
@@ -3934,6 +3935,45 @@ def cmd_doctor(bridge: Bridge, as_json: bool) -> int:
         except Exception:
             pass
 
+    agent = agent_info(root=bridge.root)
+    import control_plane
+
+    health_ttl = 3.0 * cfg["poll_interval_seconds"] + 10.0
+    agent_running = bool(agent.get("loaded")) and agent.get("state") in (None, "running")
+    health_fresh = isinstance(health, dict) and control_plane.health_fresh(health, health_ttl)
+    daemon_ok = agent_running and health_fresh
+    if not daemon_ok:
+        stage = "daemon"
+    elif health.get("axTrusted") is not True:
+        stage = "daemon_accessibility"
+    elif health.get("screenLocked") is True:
+        stage = "screen"
+    elif health.get("geminiRunning") is not True:
+        stage = "gemini"
+    else:
+        stage = "ok"
+    ready = stage == "ok"
+
+    lang = error_catalog.detect_lang()
+    tcc_py = resolve_launchagent_python()
+    if lang == "zh":
+        next_map = {
+            "daemon": "后台服务未运行或健康状态过期。运行 `gemini-task-bridge service install`（已安装则运行 `gemini-task-bridge service restart`）。",
+            "daemon_accessibility": f"后台服务缺少辅助功能权限。打开「系统设置 → 隐私与安全性 → 辅助功能」，启用 `{tcc_py}` 后运行 `gemini-task-bridge service restart`。",
+            "screen": "macOS 屏幕当前已锁定。解锁屏幕后运行 `gemini-task-bridge doctor` 复查。",
+            "gemini": "Gemini.app 未运行。运行 `open -a Gemini` 并保持主窗口打开。",
+            "ok": "一切就绪。运行 `gemini-task-bridge pair list --json` 或通过 MCP 使用桥接。",
+        }
+    else:
+        next_map = {
+            "daemon": "Daemon is not running or health is stale. Run `gemini-task-bridge service install` (or `gemini-task-bridge service restart`).",
+            "daemon_accessibility": f"Daemon lacks Accessibility permission. Open System Settings -> Privacy & Security -> Accessibility, enable `{tcc_py}`, then run `gemini-task-bridge service restart`.",
+            "screen": "macOS screen is locked. Unlock the screen and re-run `gemini-task-bridge doctor`.",
+            "gemini": "Gemini.app is not running. Run `open -a Gemini` and keep its main window open.",
+            "ok": "Ready. Run `gemini-task-bridge pair list --json` or use the bridge via MCP.",
+        }
+    next_step = next_map[stage]
+
     report = {
         "bridgeVersion": BRIDGE_VERSION,
         "python": sys.version.split()[0],
@@ -3947,19 +3987,34 @@ def cmd_doctor(bridge: Bridge, as_json: bool) -> int:
         "t3CliPath": bridge.cli_path,
         "t3CliExecutable": t3_cli_ok,
         "t3ServerRuntime": t3_runtime,
-        "launchAgent": agent_info(root=bridge.root),
+        "launchAgent": agent,
         "daemonHealth": health,
+        "ready": ready,
+        "stage": stage,
+        "next": next_step,
     }
     if as_json:
         print(json.dumps(report, ensure_ascii=False, indent=2))
     else:
-        print(f"Bridge: {BRIDGE_VERSION} | Python: {report['python']} | Root: {report['queueRoot']}")
-        print(f"Global Mode: {report['globalMode']} | Pairs: {report['pairCount']}")
-        print(f"Gemini: running={probes['geminiRunning']} pid={probes['geminiPid']} ver={gem_ver} win={win_title!r}")
-        print(f"Current AXTrusted: {probes['axTrusted']} | ScreenLocked: {probes['screenLocked']}")
-        print(f"T3 CLI: {bridge.cli_path} (required={t3_cli_required}, executable={t3_cli_ok})")
-        print(f"LaunchAgent: {report['launchAgent']}")
-        print(f"DaemonHealth: {health}")
+        def _mark(ok: bool) -> str:
+            return "✅" if ok else "❌"
+
+        ax_ok = bool(daemon_ok and health.get("axTrusted") is True)
+        screen_ok = bool(daemon_ok and health.get("screenLocked") is not True)
+        gem_ok = bool(daemon_ok and health.get("geminiRunning") is True)
+        print(f"gemini-task-bridge v{BRIDGE_VERSION} | ready={ready} | stage={stage}")
+        if lang == "zh":
+            print(f"{_mark(daemon_ok)} 后台服务（LaunchAgent + 健康心跳）")
+            print(f"{_mark(ax_ok)} 后台辅助功能权限（axTrusted）")
+            print(f"{_mark(screen_ok)} 屏幕未锁定")
+            print(f"{_mark(gem_ok)} Gemini.app 运行中")
+            print(f"下一步：{next_step}")
+        else:
+            print(f"{_mark(daemon_ok)} Daemon (LaunchAgent + fresh health)")
+            print(f"{_mark(ax_ok)} Daemon Accessibility (axTrusted)")
+            print(f"{_mark(screen_ok)} Screen unlocked")
+            print(f"{_mark(gem_ok)} Gemini.app running")
+            print(f"Next: {next_step}")
     return 0
 
 
@@ -4324,6 +4379,13 @@ def install_agent(bridge: Bridge) -> int:
         old = plistlib.loads(read_bytes(plist_path, 65536))
         if old.get("Label") != label:
             raise BridgeError("refusing_unrelated_launchagent")
+    conflicts = sorted({
+        m["label"]
+        for m in _find_launchagents_for_root(bridge.root.resolve())
+        if m["label"] != label
+    })
+    if conflicts:
+        raise BridgeError(f"conflicting_launchagent_for_root:{','.join(conflicts)}")
     py_exec = resolve_launchagent_python()
     home_dir = os.environ.get("HOME") or HOST_HOME
     env_vars = {
@@ -4558,7 +4620,8 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     except Exception as exc:
         err = str(exc) if isinstance(exc, BridgeError) else f"{type(exc).__name__}:{exc}"
-        print(json.dumps({"ok": False, "error": err}, ensure_ascii=False), file=sys.stderr)
+        desc = error_catalog.describe(err)
+        print(json.dumps({"ok": False, "error": err, **desc}, ensure_ascii=False), file=sys.stderr)
         return 2
 
 
