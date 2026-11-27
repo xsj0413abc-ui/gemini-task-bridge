@@ -38,7 +38,7 @@ if str(SCRIPT.parent) not in sys.path:
 import bridge_ax  # noqa: E402
 
 BRIDGE_VERSION = "2.1.0"
-BRIDGE_CAPABILITIES = ("local_adapter", "task_reservations", "sent_payload_store")
+BRIDGE_CAPABILITIES = ("local_adapter", "task_reservations", "sent_payload_store", "daemon_control_plane")
 
 LEDGER_HARD_MAX_BYTES = 32 * 1024 * 1024
 LEDGER_INTAKE_MAX_BYTES = 28 * 1024 * 1024
@@ -51,6 +51,7 @@ ARCHIVED_PAYLOAD_READ_MAX_BYTES = 2 * 1024 * 1024 + 65536
 LABEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 PAIR_UID_RE = re.compile(r"^[0-9a-f]{32}$")
 IDEMPOTENCY_KEY_RE = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
+MCP_SCOPE_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
 
 HOST_HOME = os.environ.get("HOME") or str(Path.home())
 DEFAULT_ROOT = Path(
@@ -255,18 +256,22 @@ def no_symlink(path: Path | str) -> None:
             raise BridgeError("symlink_path_rejected")
 
 
-def read_bytes(path: Path, limit: int) -> bytes:
+def read_bytes(path: Path, limit: int, *, private: bool = False) -> bytes:
     no_symlink(path)
     fd = os.open(str(path), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     try:
         info = os.fstat(fd)
-        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+        if private:
+            _check_private_file(info)
+        elif not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
             raise BridgeError("non_regular_or_hardlinked_file")
         if info.st_size > limit:
             raise BridgeError("file_too_large")
         with os.fdopen(fd, "rb", closefd=False) as stream:
             data = stream.read(limit + 1)
         after = os.fstat(fd)
+        if private:
+            _check_private_file(after)
         if len(data) > limit:
             raise BridgeError("file_too_large")
         if (info.st_size, info.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
@@ -319,11 +324,20 @@ def atomic_json(path: Path, value: Any) -> None:
     atomic_json_bytes(path, encode_json_bytes(value))
 
 
+def _check_private_file(info: os.stat_result) -> None:
+    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+        raise BridgeError("non_regular_or_hardlinked_file")
+    if info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o600:
+        raise BridgeError("control_plane_unavailable")
+
+
 @contextlib.contextmanager
-def file_lock(path: Path, nonblocking: bool = False):
+def file_lock(path: Path, nonblocking: bool = False, *, private: bool = False):
     no_symlink(path)
     fd = os.open(str(path), os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
     try:
+        if private:
+            _check_private_file(os.fstat(fd))
         fcntl.flock(fd, fcntl.LOCK_EX | (fcntl.LOCK_NB if nonblocking else 0))
         yield fd
     finally:
@@ -340,7 +354,9 @@ def _load_libc() -> Any:
     return ctypes.CDLL(c_path, use_errno=True)
 
 
-def atomic_rename_excl(src: Path, dst: Path, lock_dir: Path | None = None) -> None:
+def atomic_rename_excl(
+    src: Path, dst: Path, lock_dir: Path | None = None, *, private_lock: bool = False,
+) -> None:
     """Atomically publish src -> dst without overwriting existing dst and keeping st_nlink == 1."""
     no_symlink(src)
     no_symlink(dst)
@@ -382,7 +398,7 @@ def atomic_rename_excl(src: Path, dst: Path, lock_dir: Path | None = None) -> No
             raise OSError(err, os.strerror(err), str(src))
 
     lock_path = (lock_dir or dst.parent) / ".inbox_publish.lock"
-    with file_lock(lock_path):
+    with file_lock(lock_path, private=private_lock):
         if os.path.lexists(str(dst)):
             raise FileExistsError(errno.EEXIST, os.strerror(errno.EEXIST), str(dst))
         os.replace(str(src), str(dst))
@@ -612,6 +628,14 @@ def pair_adapter(entry: dict[str, Any]) -> str:
     return "t3" if val is None else str(val)
 
 
+def pair_scope_allowed(
+    pair_id: str, pair: dict[str, Any], scope: str | None, allow_pairs: set[str] | frozenset[str] | None,
+) -> bool:
+    if scope is None:
+        return allow_pairs is None or pair_id in allow_pairs
+    return pair.get("ownerScope") == scope or (allow_pairs is not None and pair_id in allow_pairs)
+
+
 def validate_pairs_data(data: Any) -> dict[str, Any]:
     if not isinstance(data, dict) or data.get("schemaVersion") != 2 or not isinstance(data.get("pairs"), dict):
         raise BridgeError("invalid_pairs_schema")
@@ -630,6 +654,16 @@ def validate_pairs_data(data: Any) -> dict[str, Any]:
         pair_uid = entry.get("pairUid")
         if pair_uid is not None and (not isinstance(pair_uid, str) or not PAIR_UID_RE.fullmatch(pair_uid)):
             raise BridgeError("invalid_pair_uid")
+
+        owner = entry.get("ownerScope")
+        if owner is not None and (not isinstance(owner, str) or not MCP_SCOPE_RE.fullmatch(owner)):
+            raise BridgeError("invalid_mcp_scope")
+        if "createdVia" in entry and entry["createdVia"] not in ("cli", "mcp", "daemon"):
+            raise BridgeError("invalid_pair_entry")
+        if "controlRequestId" in entry and (
+            not isinstance(entry["controlRequestId"], str) or not PAIR_UID_RE.fullmatch(entry["controlRequestId"])
+        ):
+            raise BridgeError("invalid_pair_entry")
 
         t3_id = entry.get("t3ThreadId")
         rep_id = entry.get("defaultReplyThreadId")
@@ -881,6 +915,8 @@ class Bridge:
         }
 
     def setup(self) -> None:
+        import control_plane
+
         no_symlink(self.root)
         self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
         for name in DIRS:
@@ -888,6 +924,7 @@ class Bridge:
             no_symlink(p)
             p.mkdir(mode=0o700, parents=True, exist_ok=True)
 
+        control_plane.setup(self)
         no_symlink(self.root / "logs/bridge.log")
         logger = logging.getLogger("t3_gemini_bridge_v2." + str(self.root))
         if not logger.handlers:
@@ -1044,7 +1081,9 @@ class Bridge:
         except (OSError, subprocess.TimeoutExpired):
             return "command_failed"
 
-    def write_health(self, probes: dict[str, Any], cfg: dict[str, Any] | None) -> None:
+    def write_health(
+        self, probes: dict[str, Any], cfg: dict[str, Any] | None, *, busy_until: str | None = None,
+    ) -> None:
         health = {
             "schemaVersion": 1,
             "bridgeVersion": BRIDGE_VERSION,
@@ -1059,6 +1098,8 @@ class Bridge:
             "globalMode": cfg.get("global_mode") if cfg else None,
             "lastError": self.last_error,
         }
+        if busy_until is not None:
+            health["busyUntil"] = busy_until
         try:
             atomic_json(self.root / ".daemon_health.json", health)
         except Exception:
@@ -1109,11 +1150,8 @@ class Bridge:
                 return False, "daemon_upgrade_required_for_v21_features"
             if _parse_version_tuple(str(health.get("bridgeVersion") or "")) < (2, 1, 0):
                 return False, "daemon_upgrade_required_for_v21_features"
-            scan_dt = parse_iso_utc(health.get("lastScanAt"))
-            if scan_dt is None:
-                return False, "daemon_upgrade_required_for_v21_features"
-            age_s = (datetime.datetime.now(datetime.timezone.utc) - scan_dt).total_seconds()
-            if age_s > max(15.0, 3.0 * poll_s):
+            import control_plane
+            if not control_plane.health_fresh(health, max(15.0, 3.0 * poll_s)):
                 return False, "daemon_upgrade_required_for_v21_features"
             return True, "live_v21_daemon"
 
@@ -3039,6 +3077,8 @@ class Bridge:
             self.notify("T3-Gemini Dispatch Deferred", f"Task {task_id} could not locate or submit to Gemini ({reason}).", cfg["notifications"])
 
     def scan(self, recover: bool = False) -> float:
+        import control_plane
+
         cfg = self.config()
         self.pairs()
         with file_lock(self.root / ".ledger.lock"):
@@ -3054,6 +3094,7 @@ class Bridge:
         self.process_outbox(cfg)
         self.process_in_flight(cfg, probes)
         self.process_outbox(cfg)
+        control_plane.process_control(self, cfg, probes, recover=recover)
         self.process_inbox(cfg, probes)
         self.reconcile_dispatching(cfg, probes, from_recover=False)
         self.process_outbox(cfg)
@@ -3143,6 +3184,7 @@ class Bridge:
         forbid_legacy_pair_uid_deferral: bool = False,
         allowed_adapters: set[str] | frozenset[str] | None = None,
         allow_pairs: set[str] | frozenset[str] | None = None,
+        owner_scope: str | None = None,
         expected_pair_uid: Any = _UNSET,
         expected_adapter: str | None = None,
         expected_gemini_title: str | None = None,
@@ -3189,12 +3231,12 @@ class Bridge:
                     raise BridgeError(gate_reason)
 
                 pairs_data = self.pairs()
-                scoped = (allowed_adapters is not None or allow_pairs is not None)
-                if allow_pairs is not None and pair_id not in allow_pairs:
-                    raise BridgeError("pair_not_accessible_in_scope")
+                scoped = (allowed_adapters is not None or allow_pairs is not None or owner_scope is not None)
                 if pair_id not in pairs_data["pairs"]:
                     raise BridgeError("pair_not_accessible_in_scope" if scoped else "unknown_pair_id")
                 pair = pairs_data["pairs"][pair_id]
+                if not pair_scope_allowed(pair_id, pair, owner_scope, allow_pairs):
+                    raise BridgeError("pair_not_accessible_in_scope")
                 if not pair.get("enabled", True):
                     raise BridgeError("pair_not_accessible_in_scope" if scoped else "pair_disabled")
                 adapter_name = pair_adapter(pair)
@@ -4050,16 +4092,9 @@ def cmd_pair(bridge: Bridge, args: argparse.Namespace) -> int:
         print(json.dumps({"globalMode": cfg["global_mode"], "pairs": out}, ensure_ascii=False, indent=2))
         return 0
 
-    if args.pair_cmd == "gemini-chats":
-        probes = bridge.system_probes()
-        if not probes.get("axTrusted"):
-            raise BridgeError("ax_not_trusted")
-        pid = probes.get("geminiPid")
-        if not pid:
-            raise BridgeError("gemini_not_running")
-        drv = bridge.ax()
-        print(json.dumps(drv.list_conversations(pid), ensure_ascii=False, indent=2))
-        return 0
+    if args.pair_cmd in ("init", "gemini-chats", "request"):
+        import control_plane
+        return control_plane.run_cli(bridge, cfg, args)
 
     if args.pair_cmd == "add":
         if not PAIR_ID_RE.fullmatch(args.id):
@@ -4111,82 +4146,11 @@ def cmd_pair(bridge: Bridge, args: argparse.Namespace) -> int:
                 "createdAt": (prev or {}).get("createdAt") or now_iso(),
                 "updatedAt": now_iso(),
             }
+            if prev is not None and pair_uid == prev.get("pairUid"):
+                for field in ("ownerScope", "createdVia", "controlRequestId"):
+                    if field in prev:
+                        pdata["pairs"][args.id][field] = prev[field]
         print(json.dumps({"ok": True, "pair": pdata["pairs"][args.id]}, ensure_ascii=False, indent=2))
-        return 0
-
-    if args.pair_cmd == "init":
-        if not PAIR_ID_RE.fullmatch(args.id):
-            raise BridgeError("invalid_pair_id")
-        if not args.gemini_title or not args.gemini_title.strip():
-            raise BridgeError("invalid_pair_gemini_title")
-        adapter, t3_thread, reply_to = _resolve_pair_adapter_args(
-            getattr(args, "adapter", None),
-            getattr(args, "t3_thread", None),
-            getattr(args, "reply_to", None),
-            route="gemini",
-        )
-        ws = str(Path(args.workspace).expanduser().resolve()) if args.workspace else None
-        if adapter == "local":
-            bridge.require_v21_runtime_for_root(cfg)
-
-        # Ensure uniqueness & no active tasks BEFORE creating Gemini conversation
-        existing = bridge.pairs()
-        if args.id in existing["pairs"] and _has_active_tasks_for_pair(bridge, args.id):
-            raise BridgeError("pair_has_active_task")
-        gem_title_req = args.gemini_title.strip()
-        for k, v in existing["pairs"].items():
-            if k != args.id and v.get("enabled", True):
-                if adapter == "t3" and pair_adapter(v) == "t3" and v.get("t3ThreadId") == t3_thread:
-                    raise BridgeError("duplicate_t3_thread_in_pairs")
-                if v.get("geminiTitle") == gem_title_req:
-                    raise BridgeError("duplicate_gemini_title_in_pairs")
-
-        probes = bridge.system_probes()
-        if not probes.get("axTrusted"):
-            raise BridgeError("ax_not_trusted")
-        pid = probes.get("geminiPid")
-        if not pid:
-            raise BridgeError("gemini_not_running")
-
-        init_prompt = args.init_prompt or (
-            f"This is a dedicated 1-to-1 bridge task conversation (pairId={args.id}, adapter={adapter}). "
-            f"Do not modify any files. Reply only with: READY ({gem_title_req})"
-        )
-        drv = bridge.ax()
-        with file_lock(bridge.root / ".gemini_ui.lock"):
-            ok, actual_title, mode_detail = drv.create_task_conversation(
-                pid=pid,
-                target_title=gem_title_req,
-                init_prompt=init_prompt,
-                workspace_path=ws,
-                wait_s=float(args.wait_sec),
-            )
-        if not ok:
-            raise BridgeError(f"gemini_init_failed:{actual_title}")
-        with bridge.pairs_tx() as pdata:
-            if adapter == "local":
-                bridge.require_v21_runtime_for_root(cfg)
-            prev = pdata["pairs"].get(args.id)
-            if prev is not None and _has_active_tasks_for_pair(bridge, args.id):
-                raise BridgeError("pair_has_active_task")
-            # pair init ALWAYS creates a fresh Gemini chat and mints a fresh pairUid
-            pdata["pairs"][args.id] = {
-                "pairId": args.id,
-                "pairUid": uuid.uuid4().hex,
-                "adapter": adapter,
-                "label": args.label or args.id,
-                "t3ThreadId": t3_thread,
-                "defaultReplyThreadId": reply_to,
-                "allowedReplyThreadIds": sorted({t3_thread, reply_to}) if adapter == "t3" else [],
-                "geminiTitle": actual_title,
-                "workspacePath": ws,
-                "route": "gemini",
-                "replyMode": args.reply_mode,
-                "enabled": True,
-                "createdAt": (prev or {}).get("createdAt") or now_iso(),
-                "updatedAt": now_iso(),
-            }
-        print(json.dumps({"ok": True, "titleMode": mode_detail, "pair": pdata["pairs"][args.id]}, ensure_ascii=False, indent=2))
         return 0
 
     if args.pair_cmd == "route":
@@ -4279,6 +4243,7 @@ def cmd_mcp(bridge: Bridge, args: argparse.Namespace) -> int:
         bridge=bridge,
         allow_pairs_raw=getattr(args, "allow_pairs", None),
         adapter_filter=getattr(args, "adapter_filter", None),
+        scope_name=getattr(args, "scope", None),
     )
 
 
@@ -4458,6 +4423,17 @@ def build_parser() -> argparse.ArgumentParser:
     p_pi.add_argument("--reply-mode", choices=("auto", "outbox", "ax_capture"), default="auto")
     p_pi.add_argument("--wait-sec", type=float, default=35.0)
 
+    for p_control in (p_gc, p_pi):
+        p_control.add_argument("--direct", action="store_true")
+        p_control.add_argument("--idempotency-key")
+        p_control.add_argument("--no-wait", action="store_true")
+    p_pi.add_argument("--json", action="store_true")
+
+    p_req = pair_sub.add_parser("request", help="Inspect or wait for a daemon control request")
+    p_req.add_argument("request_id")
+    p_req.add_argument("--wait", type=float, default=0.0)
+    p_req.add_argument("--json", action="store_true")
+
     p_pr = pair_sub.add_parser("route", help="Switch a T3 pair between t3 and gemini")
     p_pr.add_argument("id")
     p_pr.add_argument("route", choices=("t3", "gemini"))
@@ -4498,6 +4474,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_mcp = sub.add_parser("mcp", help="Run zero-dependency stdio MCP server")
     p_mcp.add_argument("--allow-pairs", default=None)
+    p_mcp.add_argument("--scope", default=None)
     p_mcp.add_argument("--adapter-filter", choices=("local", "t3", "all"), default=None)
 
     sub.add_parser("run", help="Run continuous bridge daemon")
@@ -4568,4 +4545,6 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
+    # Runtime modules import the same BridgeError and locks when invoked as a script.
+    sys.modules.setdefault(SCRIPT.stem, sys.modules[__name__])
     sys.exit(main())

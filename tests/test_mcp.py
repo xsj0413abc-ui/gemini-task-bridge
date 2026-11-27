@@ -20,13 +20,14 @@ if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
 import t3_gemini_bridge as tb  # noqa: E402
+from test_bridge import OFFLINE_ENV
 
 
 class McpClient:
     """Line-buffered stdio JSON-RPC 2.0 test client asserting strict stdout framing."""
 
     def __init__(self, root: Path, args: list[str] | None = None, env_extra: dict[str, str] | None = None) -> None:
-        env = os.environ.copy()
+        env = {**os.environ, **OFFLINE_ENV, "HOME": str(root.parent)}
         env["T3_GEMINI_BRIDGE_ROOT"] = str(root)
         env["PYTHONDONTWRITEBYTECODE"] = "1"
         if env_extra:

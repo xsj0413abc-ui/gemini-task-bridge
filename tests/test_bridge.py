@@ -19,6 +19,7 @@ from unittest import mock
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SCRIPTS_DIR = REPO_ROOT / "skills/t3-gemini-bridge/scripts"
+OFFLINE_ENV = {"PYTHONPATH": str(REPO_ROOT / "tests/fixtures/offline"), "PYTHONDONTWRITEBYTECODE": "1"}
 if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
@@ -151,6 +152,9 @@ class BridgeUnitTests(unittest.TestCase):
         # Resolve tempdir because macOS /var -> /private/var triggers no_symlink()
         self.tmp = Path(tempfile.mkdtemp(prefix="t3_gem_test_")).resolve()
         self.root = self.tmp / "bridge_root"
+        env_patch = mock.patch.dict(os.environ, {"T3_GEMINI_BRIDGE_LAUNCHAGENT_DIR": str(self.tmp / "launchagents")})
+        env_patch.start()
+        self.addCleanup(env_patch.stop)
         self.cli_log = self.tmp / "cli_calls.ndjson"
         self.cli = make_fake_t3_cli(self.tmp, self.cli_log, "ok")
         self.ax = MockAXDriver()
@@ -645,9 +649,11 @@ class BridgeUnitTests(unittest.TestCase):
         install_sh = SCRIPTS_DIR / "install.sh"
         iso_root = self.tmp / "iso_share"
         iso_bin = self.tmp / "iso_bin"
+        offline_env = {**os.environ, **OFFLINE_ENV, "HOME": str(self.tmp), "T3_GEMINI_BRIDGE_ROOT": str(iso_root)}
 
         res1 = subprocess.run(
             ["bash", str(install_sh), "--root", str(iso_root), "--bin-dir", str(iso_bin), "--label", "io.test.bridge"],
+            env=offline_env,
             capture_output=True,
             text=True,
             check=False,
@@ -656,7 +662,7 @@ class BridgeUnitTests(unittest.TestCase):
         wrapper = iso_bin / "t3-gemini-bridge"
         self.assertTrue(wrapper.is_file() and os.access(wrapper, os.X_OK))
 
-        status_res = subprocess.run([str(wrapper), "status", "--json"], capture_output=True, text=True, check=False)
+        status_res = subprocess.run([str(wrapper), "status", "--json"], env=offline_env, capture_output=True, text=True, check=False)
         self.assertEqual(status_res.returncode, 0, msg=status_res.stderr)
         status_json = json.loads(status_res.stdout)
         self.assertEqual(status_json["queueRoot"], str(iso_root))
@@ -683,6 +689,7 @@ class BridgeUnitTests(unittest.TestCase):
 
         res2 = subprocess.run(
             ["bash", str(install_sh), "--root", str(iso_root), "--bin-dir", str(iso_bin), "--label", "io.test.bridge"],
+            env=offline_env,
             capture_output=True,
             text=True,
             check=False,
@@ -710,6 +717,9 @@ class BridgePhase1Tests(unittest.TestCase):
         self.la_dir.mkdir(parents=True)
         self._env_patch = mock.patch.dict(os.environ, {"T3_GEMINI_BRIDGE_LAUNCHAGENT_DIR": str(self.la_dir)}, clear=False)
         self._env_patch.start()
+        agent_patch = mock.patch.object(tb, "agent_info", return_value={"loaded": False})
+        agent_patch.start()
+        self.addCleanup(agent_patch.stop)
         self.cli_log = self.tmp / "cli_calls.ndjson"
         self.cli = make_fake_t3_cli(self.tmp, self.cli_log, "ok")
         self.ax = MockAXDriver()

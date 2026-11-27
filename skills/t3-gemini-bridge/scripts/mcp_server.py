@@ -17,6 +17,7 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 import t3_gemini_bridge as tb  # noqa: E402
+import control_plane as cp  # noqa: E402
 
 SUPPORTED_VERSIONS = ("2025-06-18", "2025-03-26", "2024-11-05")
 MAX_MCP_LINE_BYTES = 512 * 1024
@@ -44,14 +45,21 @@ class JsonRpcError(Exception):
 class McpScope:
     """Fail-closed per-instance scope enforcement for MCP tool calls."""
 
-    def __init__(self, adapter_filter: str = "local", allow_pairs: set[str] | None = None) -> None:
+    def __init__(
+        self, adapter_filter: str = "local", allow_pairs: set[str] | None = None, scope: str | None = None,
+    ) -> None:
         if adapter_filter not in ("local", "t3", "all"):
             raise tb.BridgeError("invalid_mcp_adapter_filter")
         self.adapter_filter = adapter_filter
         self.allow_pairs = allow_pairs
+        if scope is not None:
+            cp.validate_scope(scope)
+        self.scope = scope
 
     @classmethod
-    def from_args(cls, allow_pairs_raw: str | None, adapter_filter_raw: str | None) -> McpScope:
+    def from_args(
+        cls, allow_pairs_raw: str | None, adapter_filter_raw: str | None, scope: str | None = None,
+    ) -> McpScope:
         if adapter_filter_raw is None:
             env_af = os.environ.get("T3_GEMINI_BRIDGE_MCP_ADAPTER_FILTER")
             adapter_filter = env_af.strip() if env_af is not None else "local"
@@ -76,7 +84,9 @@ class McpScope:
                 if not tok or not tb.PAIR_ID_RE.fullmatch(tok):
                     raise tb.BridgeError("invalid_mcp_allow_pairs")
                 allow_set.add(tok)
-        return cls(adapter_filter=adapter_filter, allow_pairs=allow_set)
+        if scope is None:
+            scope = os.environ.get("GEMINI_TASK_BRIDGE_MCP_SCOPE", os.environ.get("T3_GEMINI_BRIDGE_MCP_SCOPE"))
+        return cls(adapter_filter=adapter_filter, allow_pairs=allow_set, scope=scope)
 
     def allowed_adapters(self) -> frozenset[str]:
         if self.adapter_filter == "all":
@@ -93,9 +103,7 @@ class McpScope:
             return False
         if not self.adapter_allowed(tb.pair_adapter(pair)):
             return False
-        if self.allow_pairs is not None and pair_id not in self.allow_pairs:
-            return False
-        return True
+        return tb.pair_scope_allowed(pair_id, pair, self.scope, self.allow_pairs)
 
     def authorize_task(self, task_id: str, pairs_data: dict[str, Any], ledger_data: dict[str, Any]) -> tuple[bool, str | None]:
         t_rec = ledger_data["tasks"].get(task_id)
@@ -115,7 +123,7 @@ class McpScope:
         pair = pairs_data["pairs"].get(pair_id)
         if not self.pair_allowed(pair_id, pair):
             return False, None
-        if pair.get("pairUid") != pair_uid:
+        if pair.get("pairUid") != pair_uid or tb.pair_adapter(pair) != adapter:
             return False, None
         return True, pair_id
 
@@ -179,6 +187,28 @@ TOOL_SPECS: list[dict[str, Any]] = [
                 "task_id": {"type": "string", "minLength": 1},
             },
             "required": ["task_id"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "gemini_list_chats",
+        "description": "List Gemini chat titles through the daemon, with binding and scope visibility.",
+        "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+    },
+    {
+        "name": "gemini_pair_init",
+        "description": "Create and bind a local Gemini Task chat through the daemon. On timeout, call again with the same arguments.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "title": {"type": "string", "minLength": 1},
+                "pair_id": {"type": "string", "minLength": 1},
+                "label": {"type": "string"},
+                "workspace": {"type": "string", "minLength": 1},
+                "idempotency_key": {"type": "string", "minLength": 1},
+                "timeout_seconds": {"type": "number", "minimum": 1, "maximum": 300},
+            },
+            "required": ["title"],
             "additionalProperties": False,
         },
     },
@@ -278,7 +308,6 @@ class McpStdioServer:
         pairs_data = self.bridge.pairs()
         with tb.file_lock(self.bridge.root / ".ledger.lock"):
             ledger_data = self.bridge.ledger()
-        probes = self.bridge.system_probes()
         health = self.bridge.read_health() or {}
         agent = tb.agent_info()
 
@@ -309,9 +338,9 @@ class McpStdioServer:
             "ok": True,
             "bridgeVersion": tb.BRIDGE_VERSION,
             "daemonRunning": daemon_running,
-            "axTrusted": bool(health.get("axTrusted") if health else probes.get("axTrusted")),
-            "screenLocked": bool(health.get("screenLocked") if health else probes.get("screenLocked")),
-            "geminiRunning": bool(health.get("geminiRunning") if health else probes.get("geminiRunning")),
+            "axTrusted": bool(health.get("axTrusted")),
+            "screenLocked": bool(health.get("screenLocked")),
+            "geminiRunning": bool(health.get("geminiRunning")),
             "globalMode": cfg["global_mode"],
             "lastScanAt": health.get("lastScanAt"),
             "lastErrorPresent": bool(health.get("lastError")),
@@ -324,7 +353,17 @@ class McpStdioServer:
     def _tool_pairs(self) -> tuple[bool, dict[str, Any]]:
         cfg = self.bridge.config()
         pairs_data = self.bridge.pairs()
-        in_flight = self.bridge._active_in_flight_by_pair()
+        with tb.file_lock(self.bridge.root / ".ledger.lock"):
+            ledger = self.bridge.ledger()
+        in_flight = {}
+        for tid, dispatch in ledger["dispatches"].items():
+            if not isinstance(dispatch, dict) or dispatch.get("status") not in (
+                "dispatching", "in_flight", "needs_attention", "captured_to_outbox",
+            ):
+                continue
+            allowed, pid = self.scope.authorize_task(tid, pairs_data, ledger)
+            if allowed:
+                in_flight.setdefault(pid, tid)
         out = []
         for pid, p in sorted(pairs_data["pairs"].items()):
             if not self.scope.pair_allowed(pid, p):
@@ -383,6 +422,7 @@ class McpStdioServer:
                 forbid_legacy_pair_uid_deferral=True,
                 allowed_adapters=self.scope.allowed_adapters(),
                 allow_pairs=self.scope.allow_pairs,
+                owner_scope=self.scope.scope,
                 expected_pair_uid=expected_pair_uid,
                 expected_adapter=expected_adapter,
                 expected_gemini_title=expected_gemini_title,
@@ -509,12 +549,73 @@ class McpStdioServer:
         except tb.BridgeError as exc:
             return True, {"ok": False, "taskId": tid, "error": str(exc)}
 
+    def _tool_control(
+        self, kind: str, args: dict[str, Any], cancel_event: threading.Event,
+    ) -> tuple[bool, dict[str, Any]]:
+        owner = self.scope.scope or "default"
+        params: dict[str, Any] = {}
+        key = None
+        timeout = 30.0
+        if kind == "create_pair":
+            title = cp.normalized_title(args["title"])
+            pair_id = args.get("pair_id") or cp.title_pair_id(owner, title)
+            if not tb.PAIR_ID_RE.fullmatch(pair_id):
+                raise tb.BridgeError("invalid_pair_id")
+            if not self.scope.adapter_allowed("local") or (
+                self.scope.scope is None and self.scope.allow_pairs is not None and pair_id not in self.scope.allow_pairs
+            ):
+                raise tb.BridgeError("pair_not_accessible_in_scope")
+            key = args.get("idempotency_key") or cp.title_key(owner, title)
+            timeout = float(args.get("timeout_seconds", 150.0))
+            params.update(pairId=pair_id, geminiTitle=title, label=args.get("label"),
+                          workspace=args.get("workspace"), adapter="local", waitSec=35, replyMode="auto")
+
+        status = cp.submit(self.bridge, self.bridge.config(), kind, params,
+                           via="mcp", scope=owner, idempotency_key=key)
+        if not status["completed"]:
+            status = cp.wait_for_request(self.bridge, status["requestId"], timeout,
+                                         lambda: cancel_event.is_set() or self.shutdown_event.is_set())
+        out = {k: v for k, v in status.items() if k not in ("keyHash", "result")}
+        if not status["completed"]:
+            return False, out
+        if not status["ok"]:
+            if status["status"] == "unconfirmed" and status.get("kind") == kind and "result" in status:
+                out["result"] = status["result"]
+            return True, out
+        if status["kind"] != kind:
+            raise tb.BridgeError("invalid_control_request")
+        result = status["result"]
+        pairs = self.bridge.pairs()["pairs"]
+        if kind == "create_pair":
+            pair = result["pair"]
+            current = pairs.get(pair["pairId"])
+            if not self.scope.pair_allowed(pair["pairId"], current) or current.get("pairUid") != pair["pairUid"]:
+                return True, {**out, "ok": False, "status": "failed", "error": "pair_not_accessible_in_scope"}
+            return False, {**out, **result}
+
+        bound = {p["geminiTitle"].strip(): p for p in pairs.values() if p.get("enabled", True)}
+        chats = []
+        for chat in result["conversations"]:
+            if chat.get("source") != "sidebar":
+                continue
+            title = chat["title"]
+            pair = bound.get(title)
+            item = {"title": title, "bound": pair is not None, "visible": False}
+            if pair and self.scope.pair_allowed(pair["pairId"], pair):
+                item.update(visible=True, pairId=pair["pairId"])
+            chats.append(item)
+        return False, {**out, "conversations": chats}
+
     def _execute_tool(self, tool_name: str, args: dict[str, Any], cancel_event: threading.Event) -> tuple[bool, dict[str, Any]]:
         try:
             if tool_name == "gemini_health":
                 return self._tool_health()
             if tool_name == "gemini_pairs":
                 return self._tool_pairs()
+            if tool_name == "gemini_list_chats":
+                return self._tool_control("list_chats", args, cancel_event)
+            if tool_name == "gemini_pair_init":
+                return self._tool_control("create_pair", args, cancel_event)
             if tool_name == "gemini_send":
                 return self._tool_send(args, cancel_event)
             if tool_name == "gemini_wait":
@@ -528,7 +629,7 @@ class McpStdioServer:
             return True, {"ok": False, "error": f"{type(exc).__name__}:{exc}"}
 
     def _is_blocking_tool(self, tool_name: str, args: dict[str, Any]) -> bool:
-        if tool_name == "gemini_wait":
+        if tool_name in ("gemini_wait", "gemini_pair_init", "gemini_list_chats"):
             return True
         if tool_name == "gemini_send":
             if bool(args.get("wait", False)):
@@ -843,11 +944,12 @@ def run_stdio_server(
     bridge: tb.Bridge,
     allow_pairs_raw: str | None = None,
     adapter_filter: str | None = None,
+    scope_name: str | None = None,
 ) -> int:
     bridge.setup()
     cfg = bridge.config()
     bridge.require_v21_runtime_for_root(cfg)
-    scope = McpScope.from_args(allow_pairs_raw, adapter_filter)
+    scope = McpScope.from_args(allow_pairs_raw, adapter_filter, scope_name)
 
     raw_stdin = sys.stdin.buffer
     raw_stdout = sys.stdout.buffer
