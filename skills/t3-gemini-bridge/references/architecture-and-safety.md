@@ -72,10 +72,11 @@ In v2.2.0, AI hosts and unprivileged terminals never call macOS Accessibility di
 ### Interrupt & Crash Recovery (`recover=True`)
 On daemon startup, any `control/in_flight/` file without a matching `control/done/` entry is reconciled safely:
 - **`list_chats`**: Read-only and idempotent; moved back to `control/inbox/` automatically.
-- **`create_pair`** (3-step deterministic recovery; **never auto-retries AX UI creation**):
-  1. If `pairs.json` already contains a pair with `controlRequestId == requestId` → write `done` (`status: "ok"`).
-  2. Otherwise, inspect the `Gemini.app` sidebar for an **exact title match** not bound to any existing pair → bind it in `pairs.json` and write `done` (`status: "ok"`, `recovered: true`).
-  3. If neither condition holds → write `done` (`status: "unconfirmed"`, error `control_request_unconfirmed`) so the caller or user can inspect the sidebar manually before taking action.
+- **`create_pair`** (conservative recovery; **never re-runs AX creation and never auto-binds by sidebar title**):
+  1. If `pairs.json` already contains a pair with `controlRequestId == requestId` and the expected `pairUid` → write `done` (`status: "ok"`, `recovered: true`).
+  2. Otherwise → write `done` (`status: "unconfirmed"`, error `control_request_unconfirmed`) including the intended `geminiTitle` and `pairId`. The user or agent checks the `Gemini.app` sidebar and binds manually with `pair add` if the chat exists.
+
+Long AX creation does not hold the pairs lock: the daemon validates in a short transaction, performs AX under `.gemini_ui.lock`, then re-validates in a second short transaction before committing. While creating, `.daemon_health.json` carries `busy.until`, so clients do not misread the paused heartbeat as a stale daemon.
 
 ---
 
