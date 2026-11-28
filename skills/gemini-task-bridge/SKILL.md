@@ -5,7 +5,7 @@ license: MIT
 metadata:
   short-description: Unofficial macOS bridge to Gemini Desktop Task mode for Claude Code, Codex, Antigravity, and T3 Code
   platform: macos
-  version: "2.2.0"
+  version: "2.2.1"
 ---
 
 # Gemini Task Bridge (`gemini-task-bridge`)

@@ -38,7 +38,7 @@ if str(SCRIPT.parent) not in sys.path:
 import bridge_ax  # noqa: E402
 import error_catalog  # noqa: E402
 
-BRIDGE_VERSION = "2.2.0"
+BRIDGE_VERSION = "2.2.1"
 BRIDGE_CAPABILITIES = ("local_adapter", "task_reservations", "sent_payload_store", "daemon_control_plane")
 
 LEDGER_HARD_MAX_BYTES = 32 * 1024 * 1024
