@@ -22,6 +22,9 @@ SIDEBAR_STATIC_LABELS = frozenset({
     "Library", "Images", "Scheduled", "Students", "More", "Notebooks",
     "Projects", "Schedules", "Skills",
 })
+# kAXErrorCannotComplete: the target app did not answer within the messaging timeout.
+_AX_ERROR_CANNOT_COMPLETE = -25204
+
 CHROME_TEXTS = frozenset({
     "Gemini 是 AI，可能会出错。",
     "Gemini is AI and can make mistakes.",
@@ -430,6 +433,22 @@ class MacOSAXBridge:
         app_el = int(self.ax.AXUIElementCreateApplication(int(pid)))
         self.ax.AXUIElementSetMessagingTimeout(app_el, float(timeout_s))
         return app_el
+
+    def probe_responsive(self, pid: int, timeout_s: float = 3.0) -> bool | None:
+        """True if Gemini answers an AX request, False if its UI thread is stuck, None if unknown."""
+        app_el = self._app_el(pid, timeout_s=timeout_s)
+        try:
+            out = ctypes.c_void_p()
+            err = int(self.ax.AXUIElementCopyAttributeValue(app_el, self._attr("AXRole"), ctypes.byref(out)))
+            if out.value:
+                self.cf.CFRelease(out.value)
+            if err == 0:
+                return True
+            if err == _AX_ERROR_CANNOT_COMPLETE:
+                return False
+            return None
+        finally:
+            self.cf.CFRelease(app_el)
 
     def _is_minichat_window(self, win_el: int) -> bool:
         sub = self._get_str(win_el, "AXSubrole")
@@ -1133,11 +1152,8 @@ class MacOSAXBridge:
                     return False, "composer_not_found"
                 try:
                     self.ax.AXUIElementSetAttributeValue(ta, self._attr("AXFocused"), self._k_true)
-                    cf_empty = self._cfstr("")
-                    try:
-                        self.ax.AXUIElementSetAttributeValue(ta, self._attr("AXValue"), cf_empty)
-                    finally:
-                        self.cf.CFRelease(cf_empty)
+                    # Set the text once. Setting AXValue replaces the whole draft, and each extra
+                    # text change while Gemini is redrawing can freeze its UI (seen on 1.147).
                     cf_prompt = self._cfstr(prompt_text)
                     try:
                         err = int(self.ax.AXUIElementSetAttributeValue(ta, self._attr("AXValue"), cf_prompt))

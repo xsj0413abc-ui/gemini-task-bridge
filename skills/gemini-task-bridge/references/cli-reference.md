@@ -221,12 +221,16 @@ All CLI errors return structured JSON preserving the machine-readable `error` co
   "notifications": true,
   "ax_capture_grace_seconds": 6.0,
   "max_task_wait_seconds": 1800,
+  "max_parallel_tasks": 1,
   "max_message_bytes": 32768,
   "max_message_lines": 400,
   "max_receipt_file_bytes": 65536,
   "max_inbox_bytes": 262144
 }
 ```
+
+- `max_task_wait_seconds`: default time limit per task. A single task can override it with `send --max-task-minutes N` or MCP `max_task_minutes` (1–1440).
+- `max_parallel_tasks` (2.2.2+, 1–10, default 1): how many tasks may be in Gemini at once across all pairs. Keep 1: switching chats while another chat is generating froze Gemini.app 1.147.
 
 ### `pairs.json` (v2, with optional v2.2 provenance fields)
 

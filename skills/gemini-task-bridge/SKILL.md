@@ -5,7 +5,7 @@ license: MIT
 metadata:
   short-description: Unofficial macOS bridge to Gemini Desktop Task mode for Claude Code, Codex, Antigravity, and T3 Code
   platform: macos
-  version: "2.2.1"
+  version: "2.2.2"
 ---
 
 # Gemini Task Bridge (`gemini-task-bridge`)
@@ -84,20 +84,26 @@ gemini-task-bridge pair init --id "t3_reviewer" --adapter t3 \
 gemini-task-bridge pair request "<requestId>" --wait 60 --json
 ```
 
+While another task is running in Gemini, `gemini_pair_init` returns `pending`; call it again with the same params (same idempotency key) and it creates the chat once Gemini is idle.
+
 On `workspace_not_bookmarked_in_gemini`, ask the user to select that folder once via **Folders → Add new folder...** in `Gemini.app`, then retry.
 
 ---
 
 ## Workflow 3 — Dispatch, Wait & Read Replies
 
-- **MCP (preferred):** `gemini_health`, `gemini_pairs`, `gemini_list_chats`, `gemini_pair_init`, `gemini_send` *(non-blocking by default → `taskId`)*, `gemini_wait` *(chunked `1..300s`)*, `gemini_read`. Accepts snake_case and camelCase aliases (`pairId`, `taskId`, `idempotencyKey`).
+- **MCP (preferred):** `gemini_health`, `gemini_pairs`, `gemini_list_chats`, `gemini_pair_init`, `gemini_send` *(non-blocking by default → `taskId`; optional `max_task_minutes` `1..1440`, default 30)*, `gemini_wait` *(chunked `1..300s`)*, `gemini_read`. Accepts snake_case and camelCase aliases (`pairId`, `taskId`, `idempotencyKey`, `maxTaskMinutes`).
 - **CLI:**
   ```bash
   gemini-task-bridge send --pair "<pair-id>" --idempotency-key "req-001" --message "Review /abs/path/to/spec.md"
   gemini-task-bridge task wait "<taskId>" --timeout 120 --return-on-attention --json
   gemini-task-bridge task read "<taskId>" --json
   ```
-- **Rules:** Never hand-write `[[T3_BRIDGE_START:` / `[[T3_BRIDGE_DONE:` sentinels or `outbox/*.json` instructions; always pass absolute paths; custom `--task-id` cannot end with `.receipt`; same `pairId` runs FIFO, distinct `pairId`s run concurrently.
+- **Rules:** Never hand-write `[[T3_BRIDGE_START:` / `[[T3_BRIDGE_DONE:` sentinels or `outbox/*.json` instructions; always pass absolute paths; custom `--task-id` cannot end with `.receipt`.
+- **One task at a time:** all pairs share one Gemini window, so tasks run one after another (FIFO per pair, then across pairs). Sending several tasks at once is fine; they wait as `queued`. Raising `max_parallel_tasks` in `bridge_config.json` is possible but can freeze Gemini.app.
+- **Long tasks:** the bridge gives up after 30 minutes unless you pass `max_task_minutes` (CLI `--max-task-minutes`). A timed-out result carries `partialMessage` with what Gemini wrote so far. Prefer splitting work into tasks under ~20 minutes.
+- **Workspace files:** Gemini reads the workspace folder as it is on disk right now. Check out the branch you want reviewed before sending.
+- **`captureChannel: ax_capture_stopped`** in a receipt means Gemini's answer was stopped part-way; the message is partial.
 
 ---
 
@@ -120,6 +126,9 @@ Every v2.2 CLI and MCP error returns `error`, `message`, and `fix` (localized vi
 | `needs_attention` (exit `3`) | `Gemini.app` shows a confirmation card | Ask user to confirm in `Gemini.app`, then resume `gemini_wait`/`task wait` with the same `taskId`. **Do not resend.** |
 | `ax_not_trusted` | Daemon lacks Accessibility trust | Enable resolved `Python.app` in System Settings → Accessibility, then `service restart` + `doctor`. |
 | `gemini_not_running` | `Gemini.app` is closed | Ask user to open `Gemini.app` and re-check `doctor`. |
+| `blockedReason: gemini_not_responding` | `Gemini.app` is running but its window is frozen; the queue is on hold | With the user's OK run `pkill -x Gemini; sleep 2; open -a Gemini`. Queued tasks continue; do not resend. |
+| `gemini_response_stopped` | Gemini's answer was stopped before any text appeared | Make sure nobody pressed Stop or changed the model in that chat, then resend. |
+| `max_task_wait_exceeded` | Task ran past its wait limit | Use `partialMessage` if present; resend smaller or with a larger `max_task_minutes`. |
 | `screen_locked` | Mac display is locked | Wait for unlock; queues resume automatically. |
 | `control_plane_unavailable` | Daemon stopped/stale or pre-v2.2 | Run `doctor` and follow `next`. |
 | `control_request_timeout` (exit `3`) | Control op still running | Re-call `gemini_pair_init` with same params or run `pair request <requestId> --wait 60 --json`. |

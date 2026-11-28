@@ -24,6 +24,36 @@ CATALOG: dict[str, dict[str, tuple[str, str]]] = {
             "Run `open -a Gemini` to launch Gemini.app and keep its main window open.",
         ),
     },
+    "gemini_not_responding": {
+        "zh": (
+            "Gemini 界面卡住了（进程还在，但窗口不响应），任务暂时停在队列里。",
+            "强制退出并重新打开 Gemini：`pkill -x Gemini; sleep 2; open -a Gemini`。打开后排队的任务会自动继续。",
+        ),
+        "en": (
+            "Gemini's window is frozen (the app is running but not responding); tasks are held in the queue.",
+            "Force quit and reopen Gemini: `pkill -x Gemini; sleep 2; open -a Gemini`. Queued tasks continue once it is back.",
+        ),
+    },
+    "gemini_response_stopped": {
+        "zh": (
+            "Gemini 的回答被停止了（对话里显示「你已让系统停止回答」），没有拿到正文。",
+            "确认没有人在 Gemini 里点停止或切换模型，然后重新发送这条任务。",
+        ),
+        "en": (
+            "Gemini's response was stopped (the chat shows \"You stopped this response\") before any text was written.",
+            "Make sure nobody pressed Stop or switched models in Gemini, then send the task again.",
+        ),
+    },
+    "max_task_wait_exceeded": {
+        "zh": (
+            "任务超过等待上限，桥接已放弃等待（Gemini 可能还在生成）。",
+            "如有 partialMessage 就是已生成的部分。可把任务拆小，或在 gemini_send 里设置更大的 max_task_minutes 后重发。",
+        ),
+        "en": (
+            "The task exceeded its wait limit and the bridge stopped waiting (Gemini may still be generating).",
+            "partialMessage, when present, holds what Gemini wrote so far. Split the task, or resend with a larger max_task_minutes in gemini_send.",
+        ),
+    },
     "screen_locked": {
         "zh": (
             "macOS 屏幕已锁定，无法操作 Gemini 窗口。",

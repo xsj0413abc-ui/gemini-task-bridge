@@ -27,6 +27,9 @@ if str(SCRIPTS_DIR) not in sys.path:
 import bridge_ax  # noqa: E402
 import gemini_task_bridge as tb  # noqa: E402
 
+# Mock drivers switch chats instantly; skip the real-UI settle delay.
+tb.UI_SETTLE_SECONDS = 0.0
+
 
 class MockAXDriver:
     def __init__(self) -> None:
@@ -41,6 +44,10 @@ class MockAXDriver:
         self.force_submit_fail = False
         self.confirmation_card: str | None = None
         self.last_workspace_path: str | None = None
+        self.responsive = True
+
+    def probe_responsive(self, pid: int) -> bool | None:
+        return self.responsive
 
     def system_probes(self) -> dict:
         return {
@@ -370,8 +377,17 @@ class BridgeUnitTests(unittest.TestCase):
             with mock.patch("sys.stdout", new=io.StringIO()):
                 tb.cmd_send(self.bridge, argparse.Namespace(pair=pid, message=f"msg {tid}", file=None, stdin=False, task_id=tid, reply_to=None, wait=False, timeout=10, json=True))
         self.bridge.scan(recover=True)
-        # t-01 (p1) and t-03 (p2) should dispatch; t-02 (p1) waits in inbox!
+        # Default: one task at a time across all pairs. Only t-01 dispatches.
         self.assertTrue((self.root / "inbox/in_flight/t-01.task.json").exists())
+        self.assertTrue((self.root / "inbox/t-02.task.json").exists())
+        self.assertTrue((self.root / "inbox/t-03.task.json").exists())
+        self.assertEqual(len(self.ax.injected_prompts), 1)
+
+        # Opt-in parallelism: t-03 (p2) may run beside t-01; t-02 (p1) still waits for its own pair.
+        cfg = self.bridge.config()
+        cfg["max_parallel_tasks"] = 2
+        self.bridge.save_config(cfg)
+        self.bridge.scan(recover=False)
         self.assertTrue((self.root / "inbox/in_flight/t-03.task.json").exists())
         self.assertTrue((self.root / "inbox/t-02.task.json").exists())
 
@@ -777,6 +793,137 @@ class BridgeUnitTests(unittest.TestCase):
             self.assertEqual(tb.bridge_env("MCP_ALLOW_PAIRS"), "modern")
             os.environ["GEMINI_TASK_BRIDGE_MCP_ALLOW_PAIRS"] = ""
             self.assertEqual(tb.bridge_env("MCP_ALLOW_PAIRS"), "")
+
+
+    # --- v2.2.2: fixes from the 2026-11-28 pangu incident ---------------------------------
+
+    def _send_t3(self, pair: str, tid: str, msg: str = "work") -> None:
+        with mock.patch("sys.stdout", new=io.StringIO()):
+            tb.cmd_send(self.bridge, argparse.Namespace(pair=pair, message=msg, file=None, stdin=False, task_id=tid, reply_to=None, wait=False, timeout=10, json=True))
+
+    def _dispatch_status(self, tid: str) -> dict:
+        with tb.file_lock(self.root / ".ledger.lock"):
+            return dict(self.bridge.ledger()["dispatches"].get(tid) or {})
+
+    def test_v222_extract_strips_info_and_flags_stopped_notice(self) -> None:
+        tid = "v222-extract"
+        framed = tb.build_framed_prompt(tid, "p1", "thread-1", "Check", self.root / "outbox" / f"{tid}.json")
+        flags: dict = {}
+        has_sent, text = tb.extract_gemini_reply(
+            "", tid, baseline_chunks=["old"], current_chunks=["old", framed, "info"], flags=flags,
+        )
+        self.assertFalse(has_sent)
+        self.assertEqual(text, "")
+        self.assertNotIn("stopped", flags)
+
+        flags = {}
+        has_sent, text = tb.extract_gemini_reply(
+            "", tid, baseline_chunks=["old"],
+            current_chunks=["old", framed, "Found two issues.", "你已让系统停止回答", "info"], flags=flags,
+        )
+        self.assertEqual(text, "Found two issues.")
+        self.assertTrue(flags.get("stopped"))
+
+    def test_v222_stopped_reply_without_text_fails_fast(self) -> None:
+        self._add_pair("p1", "thread-1", "Gem-Stop")
+        self._send_t3("p1", "stop-empty-1")
+        self.bridge.scan(recover=True)
+        with self.bridge.ledger_tx() as ld:
+            ld["dispatches"]["stop-empty-1"]["dispatchedMono"] = time.monotonic() - 10.0
+        self.ax.conversations["Gem-Stop"]["chunks"].extend(["You stopped this response", "info"])
+        self.bridge.scan(recover=False)
+        time.sleep(0.25)
+        self.bridge.scan(recover=False)
+        d = self._dispatch_status("stop-empty-1")
+        self.assertEqual(d.get("status"), "failed")
+        self.assertEqual(d.get("reason"), "gemini_response_stopped")
+        self.assertEqual(self._cli_calls(), [])
+        self.assertTrue((self.root / "failed/stop-empty-1.task.json").exists())
+
+    def test_v222_stopped_reply_with_text_is_delivered_as_partial(self) -> None:
+        self._add_pair("p1", "thread-1", "Gem-StopPart")
+        self._send_t3("p1", "stop-part-1")
+        self.bridge.scan(recover=True)
+        with self.bridge.ledger_tx() as ld:
+            ld["dispatches"]["stop-part-1"]["dispatchedMono"] = time.monotonic() - 10.0
+        self.ax.conversations["Gem-StopPart"]["chunks"].extend(["Partial finding A", "你已让系统停止回答", "info"])
+        self.bridge.scan(recover=False)
+        time.sleep(0.25)
+        self.bridge.scan(recover=False)
+        time.sleep(0.55)
+        self.bridge.scan(recover=False)
+        calls = self._cli_calls()
+        self.assertEqual(len(calls), 1)
+        self.assertIn("Partial finding A", calls[0]["message"])
+        self.assertNotIn("info", calls[0]["message"].splitlines())
+        self.assertNotIn("你已让系统停止回答", calls[0]["message"])
+        with tb.file_lock(self.root / ".ledger.lock"):
+            t_rec = self.bridge.ledger()["tasks"]["stop-part-1"]
+        self.assertEqual(t_rec.get("captureChannel"), "ax_capture_stopped")
+
+    def test_v222_chat_still_running_in_gemini_blocks_other_pairs(self) -> None:
+        self._add_pair("p1", "thread-1", "Gem-Running")
+        self._add_pair("p2", "thread-2", "Gem-Next")
+        # p1's earlier task timed out in the bridge, but Gemini still shows the chat as running.
+        self.ax.conversations["Gem-Running"]["badge"] = "in_progress"
+        self._send_t3("p2", "blocked-1")
+        self.bridge.scan(recover=True)
+        self.assertEqual(self.ax.injected_prompts, [])
+        self.assertTrue((self.root / "inbox/blocked-1.task.json").exists())
+
+        self.ax.conversations["Gem-Running"]["badge"] = None
+        self.bridge.scan(recover=False)
+        self.assertEqual([t for t, _ in self.ax.injected_prompts], ["Gem-Next"])
+
+    def test_v222_per_task_wait_limit_times_out_with_partial_text(self) -> None:
+        self._add_pair("p1", "thread-1", "Gem-Long")
+        with self.assertRaises(tb.BridgeError) as cm:
+            self.bridge.submit_task(pair_id="p1", message="too short", task_id="bad-wait-1", max_wait_seconds=5)
+        self.assertEqual(str(cm.exception), "invalid_max_task_minutes")
+
+        self.bridge.submit_task(pair_id="p1", message="long job", task_id="long-1", max_wait_seconds=60)
+        self.bridge.scan(recover=True)
+        self.assertEqual(self._dispatch_status("long-1").get("maxWaitSeconds"), 60)
+        conv = self.ax.conversations["Gem-Long"]
+        conv["busy"] = True
+        conv["chunks"].append("Step 1 done, starting step 2")
+        with self.bridge.ledger_tx() as ld:
+            ld["dispatches"]["long-1"]["dispatchedMono"] = time.monotonic() - 30.0
+        self.bridge.scan(recover=False)
+        self.assertEqual(self._dispatch_status("long-1").get("status"), "in_flight")
+
+        with self.bridge.ledger_tx() as ld:
+            ld["dispatches"]["long-1"]["dispatchedMono"] = time.monotonic() - 61.0
+        self.bridge.scan(recover=False)
+        st = self.bridge.get_task_status("long-1")
+        self.assertEqual(st["status"], "timed_out")
+        self.assertEqual(st["reason"], "max_task_wait_exceeded")
+        self.assertEqual(st.get("partialMessage"), "Step 1 done, starting step 2")
+        rc, out = self.bridge.wait_for_task("long-1", timeout_s=0.5)
+        self.assertEqual(rc, 2)
+        self.assertEqual(out.get("partialMessage"), "Step 1 done, starting step 2")
+
+    def test_v222_frozen_gemini_holds_queue_and_reports_reason(self) -> None:
+        self._add_pair("p1", "thread-1", "Gem-Frozen")
+        self._send_t3("p1", "frozen-1")
+        self.ax.responsive = False
+        with mock.patch.object(tb, "UNRESPONSIVE_GRACE_SECONDS", 0.0):
+            self.bridge.scan(recover=True)
+            health = self.bridge.read_health()
+            self.assertIs(health.get("geminiResponsive"), False)
+            self.assertEqual(self.ax.injected_prompts, [])
+            self.assertEqual(self.bridge.get_task_status("frozen-1").get("blockedReason"), "gemini_not_responding")
+
+            self.ax.responsive = True
+            self.bridge.scan(recover=False)
+        self.assertIs(self.bridge.read_health().get("geminiResponsive"), True)
+        self.assertEqual(len(self.ax.injected_prompts), 1)
+        self.assertNotIn("blockedReason", self.bridge.get_task_status("frozen-1"))
+
+    def test_v222_brief_ax_failures_are_not_reported_as_frozen(self) -> None:
+        self.ax.responsive = False
+        self.bridge.scan(recover=True)  # default grace period has not elapsed yet
+        self.assertIs(self.bridge.read_health().get("geminiResponsive"), True)
 
 
 class BridgePhase1Tests(unittest.TestCase):
@@ -2320,6 +2467,9 @@ class BridgePhase1Tests(unittest.TestCase):
         self.assertEqual(out_w["message"], big_reply)
 
     def test_review3_p1_in_flight_survives_lowered_max_inbox_bytes_and_missing_file(self) -> None:
+        cfg = self.bridge.config()
+        cfg["max_parallel_tasks"] = 2  # this test needs two pairs in flight at once
+        self.bridge.save_config(cfg)
         with mock.patch("sys.stdout", new=io.StringIO()):
             tb.cmd_pair(
                 self.bridge,
@@ -2445,6 +2595,9 @@ class BridgePhase1Tests(unittest.TestCase):
         self.assertEqual(self.bridge._active_in_flight_by_pair(), {})
 
     def test_review4_p1_in_flight_tampered_task_id_isolates_file_and_both_pairs_complete(self) -> None:
+        cfg = self.bridge.config()
+        cfg["max_parallel_tasks"] = 2  # this test needs two pairs in flight at once
+        self.bridge.save_config(cfg)
         with mock.patch("sys.stdout", new=io.StringIO()):
             tb.cmd_pair(
                 self.bridge,

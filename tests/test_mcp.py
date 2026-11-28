@@ -20,6 +20,9 @@ if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
 import gemini_task_bridge as tb  # noqa: E402
+
+# Mock drivers switch chats instantly; skip the real-UI settle delay.
+tb.UI_SETTLE_SECONDS = 0.0
 from test_bridge import OFFLINE_ENV
 
 
@@ -565,6 +568,40 @@ class McpServerTests(unittest.TestCase):
             r_wait = c.recv(timeout=2.0)["result"]
             self.assertFalse(r_wait["isError"])
             self.assertEqual(r_wait["structuredContent"]["message"], big_reply)
+        finally:
+            rc, _ = c.close()
+            self.assertEqual(rc, 0)
+
+
+    def test_v222_send_accepts_max_task_minutes_and_reports_frozen_gemini(self) -> None:
+        c = McpClient(self.root, ["--allow-pairs", "loc_a,loc_b"], self.base_env)
+        try:
+            c.send({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18"}})
+            c.recv()
+            c.send({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {
+                "name": "gemini_send", "arguments": {"pair_id": "loc_a", "message": "Long review", "max_task_minutes": 45}}})
+            r1 = c.recv(timeout=3.0)["result"]
+            self.assertFalse(r1["isError"], r1)
+            tid1 = r1["structuredContent"]["taskId"]
+            c.send({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {
+                "name": "gemini_send", "arguments": {"pairId": "loc_b", "message": "Alias form", "maxTaskMinutes": 2}}})
+            r2 = c.recv(timeout=3.0)["result"]
+            self.assertFalse(r2["isError"], r2)
+            tid2 = r2["structuredContent"]["taskId"]
+            with tb.file_lock(self.root / ".ledger.lock"):
+                ld = self.bridge.ledger()
+            self.assertEqual(ld["dispatches"][tid1].get("maxWaitSeconds"), 2700)
+            self.assertEqual(ld["dispatches"][tid2].get("maxWaitSeconds"), 120)
+
+            # A frozen Gemini window is explained to the caller instead of a silent "queued".
+            health = self.bridge.read_health() or {}
+            health.update({"geminiResponsive": False})
+            tb.atomic_json(self.root / ".daemon_health.json", health)
+            c.send({"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {
+                "name": "gemini_wait", "arguments": {"task_id": tid1, "timeout_seconds": 1}}})
+            r3 = c.recv(timeout=3.0)["result"]["structuredContent"]
+            self.assertEqual(r3.get("blockedReason"), "gemini_not_responding")
+            self.assertIn("pkill -x Gemini", r3.get("fix", ""))
         finally:
             rc, _ = c.close()
             self.assertEqual(rc, 0)

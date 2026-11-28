@@ -447,6 +447,23 @@ class ControlPlaneTests(unittest.TestCase):
                 self.assertEqual(self._result(rid)["error"], expected)
         self.assertEqual(self.ax.injected_prompts, [])
 
+    def test_v222_create_waits_while_a_task_is_running(self):
+        self._seed_pair("busy")
+        self.daemon.submit_task(pair_id="busy", message="long work", task_id="busy-task")
+        self.daemon.process_inbox(self.cfg, self.ax.system_probes())
+        self.assertEqual(len(self.ax.injected_prompts), 1)  # busy-task is now in Gemini
+
+        rid = self._submit("fresh", key="wait-key")
+        cp.process_control(self.daemon, self.cfg, self.ax.system_probes())
+        self.assertEqual(self._result(rid)["status"], "pending")
+        self.assertNotIn("Title fresh", self.ax.conversations)
+
+        with self.daemon.ledger_tx() as ld:
+            ld["dispatches"]["busy-task"]["status"] = "completed"
+        cp.process_control(self.daemon, self.cfg, self.ax.system_probes())
+        self.assertEqual(self._result(rid)["status"], "ok")
+        self.assertIn("Title fresh", self.ax.conversations)
+
     def test_list_and_task_dispatch_serialize_on_shared_ui_lock(self):
         self._seed_pair("target")
         self.daemon.submit_task(pair_id="target", message="actual task", task_id="queued-task")

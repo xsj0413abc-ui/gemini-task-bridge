@@ -150,7 +150,11 @@ TOOL_SPECS: list[dict[str, Any]] = [
     },
     {
         "name": "gemini_send",
-        "description": "Submit a task to a scoped Gemini bridge pair. Defaults to non-blocking immediate return with durable taskId.",
+        "description": (
+            "Submit a task to a scoped Gemini bridge pair. Defaults to non-blocking immediate return with durable taskId. "
+            "Tasks run one at a time across all pairs and wait in a queue. max_task_minutes sets when the bridge gives up "
+            "on this task (default 30); a timed-out result includes partialMessage when Gemini had written something."
+        ),
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -158,6 +162,7 @@ TOOL_SPECS: list[dict[str, Any]] = [
                 "message": {"type": "string", "minLength": 1},
                 "wait": {"type": "boolean"},
                 "timeout_seconds": {"type": "number", "minimum": 1, "maximum": 300},
+                "max_task_minutes": {"type": "integer", "minimum": 1, "maximum": 1440},
                 "return_on_attention": {"type": "boolean"},
                 "idempotency_key": {"type": "string", "minLength": 1},
             },
@@ -221,6 +226,7 @@ ARG_ALIASES: dict[str, str] = {
     "pairId": "pair_id",
     "taskId": "task_id",
     "idempotencyKey": "idempotency_key",
+    "maxTaskMinutes": "max_task_minutes",
 }
 
 
@@ -314,6 +320,12 @@ class McpStdioServer:
         if payload.get("ok") is False and isinstance(payload.get("error"), str):
             desc = ec.describe(payload["error"])
             payload = {**payload, **{k: v for k, v in desc.items() if k not in payload}}
+        else:
+            # Explain known failure reasons and blockers (e.g. a frozen Gemini window) in plain language.
+            code = payload.get("blockedReason") or payload.get("reason")
+            if isinstance(code, str) and code in ec.CATALOG:
+                desc = ec.describe(code)
+                payload = {**payload, **{k: v for k, v in desc.items() if k not in payload}}
         res: dict[str, Any] = {
             "content": [{"type": "text", "text": json.dumps(payload, ensure_ascii=False)}],
             "isError": is_error,
@@ -360,6 +372,7 @@ class McpStdioServer:
             "axTrusted": bool(health.get("axTrusted")),
             "screenLocked": bool(health.get("screenLocked")),
             "geminiRunning": bool(health.get("geminiRunning")),
+            "geminiResponsive": health.get("geminiResponsive") is not False,
             "globalMode": cfg["global_mode"],
             "lastScanAt": health.get("lastScanAt"),
             "lastErrorPresent": bool(health.get("lastError")),
@@ -432,6 +445,7 @@ class McpStdioServer:
         timeout_s = float(args.get("timeout_seconds", 30.0))
         ret_att = bool(args.get("return_on_attention", True))
         idem_key = args.get("idempotency_key")
+        max_task_minutes = args.get("max_task_minutes")
 
         try:
             res = self.bridge.submit_task(
@@ -448,6 +462,7 @@ class McpStdioServer:
                 expected_t3_thread_id=expected_t3_thread_id,
                 expected_default_reply_thread_id=expected_default_reply_thread_id,
                 require_v21_runtime=True,
+                max_wait_seconds=int(max_task_minutes) * 60 if max_task_minutes is not None else None,
             )
         except tb.BridgeError as exc:
             return True, {"ok": False, "error": str(exc)}
@@ -481,7 +496,10 @@ class McpStdioServer:
             st = self.bridge.get_task_status(tid)
             is_terminal_err = st["status"] in ("failed", "timed_out", "unknown_timeout")
             if is_terminal_err:
-                return True, {"ok": False, "completed": True, "taskId": tid, "pairId": pair_id, "status": st["status"], "reason": st.get("reason")}
+                err_out = {"ok": False, "completed": True, "taskId": tid, "pairId": pair_id, "status": st["status"], "reason": st.get("reason")}
+                if st.get("partialMessage"):
+                    err_out["partialMessage"] = st["partialMessage"]
+                return True, err_out
             if st["status"] == "sent":
                 try:
                     p = self.bridge.read_task_payload(tid)
@@ -490,14 +508,17 @@ class McpStdioServer:
                     return True, {"ok": False, "taskId": tid, "error": str(exc)}
             if st["status"] == "direct_t3":
                 return False, _with_replay({"ok": True, "completed": True, "routed": "t3", "taskId": tid, "pairId": pair_id, "status": "direct_t3", "deliveryKind": "direct_t3_forwarded", "hasReply": False})
-            return False, _with_replay({
+            pending_out = {
                 "ok": True,
                 "completed": False,
                 "taskId": tid,
                 "pairId": pair_id,
                 "status": st["status"],
                 "nextAction": "call gemini_wait with task_id",
-            })
+            }
+            if st.get("blockedReason"):
+                pending_out["blockedReason"] = st["blockedReason"]
+            return False, _with_replay(pending_out)
 
         rc, wait_out = self.bridge.wait_for_task(
             tid,

@@ -453,6 +453,29 @@ def _discard(bridge: tb.Bridge, path: Path, reason: str) -> None:
         pass
 
 
+def _gemini_task_running(bridge: tb.Bridge, probes: dict[str, Any]) -> bool:
+    """True while a bridge task is in Gemini or a paired chat still shows "In progress".
+
+    Creating a chat switches Gemini's window and types into it; doing that while another
+    chat is generating is what froze Gemini.app 1.147, so creates wait for an idle window.
+    """
+    if bridge._active_in_flight_by_pair():
+        return True
+    drv = bridge.ax()
+    pid = probes.get("geminiPid")
+    if drv is None or not pid or not probes.get("axTrusted") or not probes.get("geminiRunning"):
+        return False
+    try:
+        convs = drv.list_conversations(pid).get("conversations", [])
+        titles = {p.get("geminiTitle") for p in bridge.pairs()["pairs"].values() if isinstance(p, dict)}
+    except Exception:
+        return False
+    return any(
+        isinstance(c, dict) and c.get("badge") == "in_progress" and c.get("title") in titles
+        for c in convs
+    )
+
+
 def process_control(bridge: tb.Bridge, cfg: dict[str, Any], probes: dict[str, Any], *, recover: bool = False) -> None:
     root = bridge.root / "control"
     # A durable reservation may survive a client crash before publishing its inbox file.
@@ -495,6 +518,7 @@ def process_control(bridge: tb.Bridge, cfg: dict[str, Any], probes: dict[str, An
     created = False
     with tb.file_lock(root / ".queue.lock", private=True):
         queue = sorted((root / "inbox").glob("*.json"), key=lambda p: (p.lstat().st_mtime_ns, p.name))
+    busy: bool | None = None  # checked once, only when a create request is waiting
     for queued in queue:
         rid = queued.stem
         if not tb.PAIR_UID_RE.fullmatch(rid):
@@ -507,6 +531,11 @@ def process_control(bridge: tb.Bridge, cfg: dict[str, Any], probes: dict[str, An
                     continue
                 if req["kind"] == "create_pair" and created:
                     continue
+                if req["kind"] == "create_pair":
+                    if busy is None:
+                        busy = _gemini_task_running(bridge, probes)
+                    if busy:
+                        continue  # stays pending; the caller re-polls with the same idempotency key
                 path = _path(root, "in_flight", rid)
                 _rename(queued, path)
             except FileNotFoundError:
