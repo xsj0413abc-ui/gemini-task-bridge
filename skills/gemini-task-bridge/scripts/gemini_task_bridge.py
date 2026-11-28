@@ -38,7 +38,7 @@ if str(SCRIPT.parent) not in sys.path:
 import bridge_ax  # noqa: E402
 import error_catalog  # noqa: E402
 
-BRIDGE_VERSION = "2.2.1"
+BRIDGE_VERSION = "2.2.2"
 BRIDGE_CAPABILITIES = ("local_adapter", "task_reservations", "sent_payload_store", "daemon_control_plane")
 
 LEDGER_HARD_MAX_BYTES = 32 * 1024 * 1024
@@ -179,7 +179,21 @@ _UI_NOISE_EXACT = frozenset({
     "已完成",
     "In progress",
     "进行中",
+    "info",
 })
+
+# Gemini's "you stopped this response" bubble (CHAT_BUBBLE_STOPPED_RESPONSE in en / zh_CN / zh_TW).
+STOPPED_RESPONSE_TEXTS = frozenset({
+    "You stopped this response",
+    "你已让系统停止回答",
+    "你停止了這則回覆",
+})
+
+# After switching Gemini to another chat, wait this long before typing into it.
+# Typing while Gemini is still redrawing the chat froze Gemini 1.147 (SwiftUI cycle).
+UI_SETTLE_SECONDS = 2.5
+# Gemini must fail AX requests this long before it is reported as not responding.
+UNRESPONSIVE_GRACE_SECONDS = 20.0
 
 
 class BridgeError(Exception):
@@ -464,6 +478,7 @@ def default_config() -> dict[str, Any]:
         "notifications": True,
         "ax_capture_grace_seconds": 6.0,
         "max_task_wait_seconds": 1800,
+        "max_parallel_tasks": 1,
         "max_message_bytes": 32768,
         "max_message_lines": 400,
         "max_receipt_file_bytes": 65536,
@@ -537,8 +552,12 @@ def extract_gemini_reply(
     current_chunks: list[str] | None = None,
     max_bytes: int = 31000,
     max_lines: int = 380,
+    flags: dict[str, Any] | None = None,
 ) -> tuple[bool, str]:
-    """Extract only Gemini's new reply for task_id, ignoring prior turns, prompt echoes, and UI chrome."""
+    """Extract only Gemini's new reply for task_id, ignoring prior turns, prompt echoes, and UI chrome.
+
+    If `flags` is given, flags["stopped"] is set when the reply contains Gemini's stopped-response notice.
+    """
     start_marker = f"{SENTINEL_START_PREFIX}{task_id}{SENTINEL_SUFFIX}"
     done_marker = f"{SENTINEL_DONE_PREFIX}{task_id}{SENTINEL_SUFFIX}"
 
@@ -623,6 +642,10 @@ def extract_gemini_reply(
             if not s:
                 continue
             line = s
+        if s in STOPPED_RESPONSE_TEXTS:
+            if flags is not None:
+                flags["stopped"] = True
+            continue
         if s in _UI_NOISE_EXACT or s in bridge_ax.CHROME_TEXTS:
             continue
         cleaned_lines.append(line)
@@ -631,6 +654,17 @@ def extract_gemini_reply(
     if not cleaned:
         return has_sentinel, ""
     return has_sentinel, _clip_to_limits(cleaned, max_bytes=max_bytes, max_lines=max_lines)
+
+
+MAX_WAIT_SECONDS_RANGE = (60, 86400)
+
+
+def _valid_max_wait_seconds(value: Any) -> int | None:
+    """Return a per-task wait limit in seconds, or None when absent/invalid."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    lo, hi = MAX_WAIT_SECONDS_RANGE
+    return value if lo <= value <= hi else None
 
 
 def pair_adapter(entry: dict[str, Any]) -> str:
@@ -913,6 +947,8 @@ class Bridge:
         self._ax_missing_notified = False
         self._locked_notified = False
         self._dispatch_cooldown: dict[str, tuple[float, int, str]] = {}
+        self._unresponsive_since: float | None = None
+        self._unresponsive_notified = False
 
     def ax(self) -> Any:
         if self._ax_driver is not None:
@@ -933,6 +969,39 @@ class Bridge:
             "geminiRunning": pid is not None,
             "geminiPid": pid,
         }
+
+    def check_gemini_responsive(self, probes: dict[str, Any], cfg: dict[str, Any]) -> bool:
+        """Probe whether Gemini's UI answers AX requests; report False only after a grace period."""
+        drv = self.ax()
+        pid = probes.get("geminiPid")
+        if not probes.get("geminiRunning") or not pid or not probes.get("axTrusted") or drv is None or not hasattr(drv, "probe_responsive"):
+            self._unresponsive_since = None
+            self._unresponsive_notified = False
+            return True
+        try:
+            answer = drv.probe_responsive(pid)
+        except Exception:
+            answer = None
+        now_m = time.monotonic()
+        if answer is True:
+            if self._unresponsive_since is not None:
+                self.log("gemini_responsive_again")
+            self._unresponsive_since = None
+            self._unresponsive_notified = False
+            return True
+        if answer is False and self._unresponsive_since is None:
+            self._unresponsive_since = now_m
+        if self._unresponsive_since is None or now_m - self._unresponsive_since < UNRESPONSIVE_GRACE_SECONDS:
+            return True
+        if not self._unresponsive_notified:
+            self._unresponsive_notified = True
+            self.log("gemini_not_responding", geminiPid=pid)
+            self.notify(
+                "Gemini is not responding",
+                "Gemini's window is frozen. Force quit Gemini and open it again; queued tasks will continue.",
+                cfg["notifications"],
+            )
+        return False
 
     def setup(self) -> None:
         import control_plane
@@ -1008,6 +1077,10 @@ class Bridge:
         max_wait = c.get("max_task_wait_seconds", 1800)
         if isinstance(max_wait, bool) or not isinstance(max_wait, int) or not 10 <= max_wait <= 86400:
             raise BridgeError("invalid_max_task_wait")
+        max_par = c.get("max_parallel_tasks", 1)
+        if isinstance(max_par, bool) or not isinstance(max_par, int) or not 1 <= max_par <= 10:
+            raise BridgeError("invalid_max_parallel_tasks")
+        c["max_parallel_tasks"] = max_par
         for key, default, ceiling in (
             ("max_message_bytes", 32768, 1048576),
             ("max_message_lines", 400, 10000),
@@ -1114,6 +1187,7 @@ class Bridge:
             "axTrusted": bool(probes.get("axTrusted", False)),
             "screenLocked": bool(probes.get("screenLocked", False)),
             "geminiRunning": bool(probes.get("geminiRunning", False)),
+            "geminiResponsive": probes.get("geminiResponsive", True) is not False,
             "geminiPid": probes.get("geminiPid"),
             "globalMode": cfg.get("global_mode") if cfg else None,
             "lastError": self.last_error,
@@ -2475,6 +2549,36 @@ class Bridge:
                     }
                     self.log("legacy_in_flight_hydrated", tid, pairId=pid_name)
 
+    def _capture_partial_reply(self, tid: str, d_rec: dict[str, Any], probes: dict[str, Any], cfg: dict[str, Any]) -> str | None:
+        """Best effort: read what Gemini has written so far, only if the task's chat is already on screen."""
+        if not probes.get("axTrusted") or not probes.get("geminiRunning") or probes.get("screenLocked"):
+            return None
+        if probes.get("geminiResponsive") is False:
+            return None
+        drv = self.ax()
+        pid = probes.get("geminiPid")
+        gem_title = d_rec.get("geminiTitle")
+        if drv is None or not pid or not gem_title:
+            return None
+        try:
+            with file_lock(self.root / ".gemini_ui.lock"):
+                if drv.get_window_title(pid) != gem_title:
+                    return None
+                poll = drv.poll_conversation(pid)
+        except Exception:
+            return None
+        if poll.get("window_title") != gem_title:
+            return None
+        _, text = extract_gemini_reply(
+            poll_text=str(poll.get("text") or ""),
+            task_id=tid,
+            baseline_chunks=d_rec.get("baselineChunks"),
+            current_chunks=poll.get("chunks"),
+            max_bytes=max(1024, cfg["max_message_bytes"] - 512),
+            max_lines=max(20, cfg["max_message_lines"] - 15),
+        )
+        return text or None
+
     def process_in_flight(self, cfg: dict[str, Any], probes: dict[str, Any]) -> None:
         self.reconcile_legacy_in_flight(cfg)
         in_flight_files = sorted((self.root / "inbox/in_flight").glob("*.task.json"))
@@ -2582,20 +2686,23 @@ class Bridge:
                     if isinstance(cur_d, dict) and "status" in cur_d and "pairId" in cur_d:
                         cur_d["dispatchedMono"] = now_mono
                 disp_mono = now_mono
-            if (now_mono - disp_mono) > cfg["max_task_wait_seconds"]:
+            wait_limit = _valid_max_wait_seconds(d_rec.get("maxWaitSeconds")) or cfg["max_task_wait_seconds"]
+            if (now_mono - disp_mono) > wait_limit:
                 reason = (
                     "max_task_wait_exceeded_while_needs_attention"
                     if d_rec.get("status") == "needs_attention"
                     else "max_task_wait_exceeded"
                 )
+                partial = self._capture_partial_reply(tid, d_rec, probes, cfg)
                 if path is not None and path.exists() and not path.is_symlink():
                     self.move(path, "failed")
-                self.notify("Gemini Task Timeout", f"Task {tid} exceeded {cfg['max_task_wait_seconds']}s without completion.", cfg["notifications"])
+                self.notify("Gemini Task Timeout", f"Task {tid} exceeded {wait_limit}s without completion.", cfg["notifications"])
                 with self.ledger_tx() as ld:
-                    ld["dispatches"].setdefault(tid, {}).update(
-                        status="timed_out", updatedAt=now_iso(), reason=reason
-                    )
-                self.log("in_flight_timed_out", tid, reason)
+                    upd: dict[str, Any] = {"status": "timed_out", "updatedAt": now_iso(), "reason": reason}
+                    if partial:
+                        upd["partialMessage"] = partial
+                    ld["dispatches"].setdefault(tid, {}).update(upd)
+                self.log("in_flight_timed_out", tid, reason, partialBytes=len(partial.encode("utf-8")) if partial else 0)
                 continue
             still_active.append((path, task))
 
@@ -2603,6 +2710,8 @@ class Bridge:
             return
 
         if not probes.get("axTrusted") or not probes.get("geminiRunning") or probes.get("screenLocked"):
+            return
+        if probes.get("geminiResponsive") is False:
             return
         drv = self.ax()
         pid = probes.get("geminiPid")
@@ -2733,6 +2842,7 @@ class Bridge:
             if reply_mode == "outbox":
                 continue
 
+            reply_flags: dict[str, Any] = {}
             has_sentinel, reply_text = extract_gemini_reply(
                 poll_text=str(poll.get("text") or ""),
                 task_id=tid,
@@ -2741,7 +2851,9 @@ class Bridge:
                 current_chunks=poll.get("chunks"),
                 max_bytes=max(1024, cfg["max_message_bytes"] - 512),
                 max_lines=max(20, cfg["max_message_lines"] - 15),
+                flags=reply_flags,
             )
+            stopped = bool(reply_flags.get("stopped")) and not has_sentinel
             if d_rec.get("baselineUnknown"):
                 start_marker = f"{SENTINEL_START_PREFIX}{tid}{SENTINEL_SUFFIX}"
                 poll_text_str = str(poll.get("text") or "")
@@ -2750,6 +2862,16 @@ class Bridge:
                 if not (has_start_boundary and has_sentinel):
                     continue
             if not reply_text:
+                if stopped:
+                    # Gemini shows "you stopped this response" and nothing else: fail now instead of
+                    # waiting for the timeout or delivering UI labels as the reply.
+                    if path is not None and path.exists() and not path.is_symlink():
+                        self.move(path, "failed")
+                    with self.ledger_tx() as ld:
+                        ld["dispatches"].setdefault(tid, {}).update(
+                            status="failed", reason="gemini_response_stopped", updatedAt=now_iso()
+                        )
+                    self.log("in_flight_failed", tid, "gemini_response_stopped", pairId=pid_name)
                 continue
             base_len = int(d_rec.get("baselineTextLen") or 0)
             cur_total_len = len(str(poll.get("text") or ""))
@@ -2773,7 +2895,11 @@ class Bridge:
                     receipt_payload: dict[str, Any] = {
                         "taskId": tid,
                         "pairId": pid_name,
-                        "captureChannel": "ax_capture_sentinel" if has_sentinel else "ax_capture_stable",
+                        "captureChannel": (
+                            "ax_capture_sentinel" if has_sentinel
+                            else "ax_capture_stopped" if stopped
+                            else "ax_capture_stable"
+                        ),
                         "message": msg,
                     }
                     if d_rec.get("pairUid") is not None:
@@ -2846,6 +2972,8 @@ class Bridge:
         if not probes.get("geminiRunning") or not pid or drv is None:
             self.log("dispatch_waiting", reason="gemini_not_running")
             return
+        if probes.get("geminiResponsive") is False:
+            return
 
         pairs_data = self.pairs()
         active_by_pair = self._active_in_flight_by_pair()
@@ -2858,6 +2986,12 @@ class Bridge:
             for c in conv_info.get("conversations", [])
             if isinstance(c, dict) and isinstance(c.get("title"), str)
         }
+        # Paired chats that Gemini still shows as running (e.g. a timed-out task that kept going).
+        badge_busy_pairs = {
+            p_id for p_id, p in pairs_data["pairs"].items()
+            if isinstance(p, dict) and badge_by_title.get(p.get("geminiTitle")) == "in_progress"
+        }
+        max_parallel = cfg.get("max_parallel_tasks", 1)
         now_mono = time.monotonic()
 
         for path in inbox_files:
@@ -2941,6 +3075,10 @@ class Bridge:
                 continue
             if badge_by_title.get(pair["geminiTitle"]) == "in_progress":
                 continue
+            # One Gemini window serves every pair: by default run one task at a time so the
+            # bridge never switches chats or types while another chat is still generating.
+            if len(set(active_by_pair) | badge_busy_pairs) >= max_parallel:
+                continue
 
             cd = self._dispatch_cooldown.get(tid)
             if cd and now_mono < cd[0]:
@@ -2958,6 +3096,8 @@ class Bridge:
                 if not ok_open:
                     self._record_cooldown(tid, open_reason, cfg)
                     continue
+                if open_reason != "already_open" and UI_SETTLE_SECONDS > 0:
+                    time.sleep(UI_SETTLE_SECONDS)
                 poll_a = drv.poll_conversation(pid)
                 if poll_a.get("window_title") != gem_title:
                     self._record_cooldown(tid, "title_verification_failed", cfg)
@@ -2986,6 +3126,9 @@ class Bridge:
                         "requestSha256": sha256_text(msg)[0],
                         "createdAt": task.get("createdAt") or now_iso(),
                     })
+                    task_max_wait = _valid_max_wait_seconds(task.get("maxWaitSeconds"))
+                    if task_max_wait is not None and "maxWaitSeconds" not in rec:
+                        rec["maxWaitSeconds"] = task_max_wait
                     rec.update(
                         status="dispatching",
                         replyMode=task.get("replyMode") or pair.get("replyMode", "auto"),
@@ -3021,6 +3164,8 @@ class Bridge:
                         reverted_before_submit = True
                         sub_reason = open_reason2
                     else:
+                        if open_reason2 != "already_open" and UI_SETTLE_SECONDS > 0:
+                            time.sleep(UI_SETTLE_SECONDS)
                         poll_c = drv.poll_conversation(pid)
                         if poll_c.get("window_title") != gem_title:
                             reverted_before_submit = True
@@ -3105,6 +3250,7 @@ class Bridge:
         with file_lock(self.root / ".ledger.lock"):
             self.ledger()
         probes = self.system_probes()
+        probes["geminiResponsive"] = self.check_gemini_responsive(probes, cfg)
         self.write_health(probes, cfg)
         if recover:
             self.recover(cfg, probes)
@@ -3212,6 +3358,7 @@ class Bridge:
         expected_t3_thread_id: Any = _UNSET,
         expected_default_reply_thread_id: Any = _UNSET,
         require_v21_runtime: bool = False,
+        max_wait_seconds: int | None = None,
     ) -> dict[str, Any]:
         if not isinstance(pair_id, str) or not PAIR_ID_RE.fullmatch(pair_id):
             raise BridgeError("invalid_pair_id")
@@ -3225,6 +3372,8 @@ class Bridge:
                 raise BridgeError("reserved_task_id_suffix")
         if idempotency_key is not None and not IDEMPOTENCY_KEY_RE.fullmatch(idempotency_key):
             raise BridgeError("invalid_idempotency_key")
+        if max_wait_seconds is not None and _valid_max_wait_seconds(max_wait_seconds) is None:
+            raise BridgeError("invalid_max_task_minutes")
 
         req_sha256, _ = sha256_text(message)
 
@@ -3382,6 +3531,8 @@ class Bridge:
                         "message": message,
                         "createdAt": now_iso(),
                     }
+                    if max_wait_seconds is not None:
+                        envelope["maxWaitSeconds"] = max_wait_seconds
                     envelope_bytes = encode_json_bytes(envelope)
                     if len(envelope_bytes) > cfg["max_inbox_bytes"]:
                         raise BridgeError("inbox_envelope_limit_exceeded")
@@ -3435,6 +3586,8 @@ class Bridge:
                                     "createdAt": envelope["createdAt"],
                                     "updatedAt": now_iso(),
                                 }
+                                if max_wait_seconds is not None:
+                                    ld["dispatches"][tid]["maxWaitSeconds"] = max_wait_seconds
                                 if idempotency_key is not None:
                                     ld["idempotencyKeys"][scope_k] = {
                                         "taskId": tid,
@@ -3687,6 +3840,8 @@ class Bridge:
                     "hasReply": ds == "completed",
                     "updatedAt": d_rec.get("updatedAt"),
                 })
+                if isinstance(d_rec.get("partialMessage"), str):
+                    base["partialMessage"] = d_rec["partialMessage"]
                 return base
 
         # Active states
@@ -3701,6 +3856,10 @@ class Bridge:
             return base
         if isinstance(d_rec, dict):
             ds = d_rec.get("status")
+            if ds in ("direct_t3_sending", "needs_attention", "in_flight", "dispatching", "queued"):
+                health = self.read_health()
+                if isinstance(health, dict) and health.get("geminiResponsive") is False:
+                    base["blockedReason"] = "gemini_not_responding"
             if ds in ("direct_t3_sending", "needs_attention", "in_flight", "dispatching"):
                 base.update({"status": ds, "terminal": False, "hasReply": False, "updatedAt": d_rec.get("updatedAt")})
                 return base
@@ -3805,7 +3964,7 @@ class Bridge:
                 }
 
             if cur in ("failed", "unknown_timeout", "timed_out"):
-                return 2, {
+                out_err: dict[str, Any] = {
                     "ok": False,
                     "completed": True,
                     "routed": "gemini",
@@ -3814,6 +3973,9 @@ class Bridge:
                     "status": cur,
                     "reason": st.get("reason"),
                 }
+                if st.get("partialMessage"):
+                    out_err["partialMessage"] = st["partialMessage"]
+                return 2, out_err
 
             if return_on_attention and cur == "needs_attention":
                 return 3, {
@@ -3852,7 +4014,7 @@ class Bridge:
             else:
                 time.sleep(sleep_for)
 
-        return 1, {
+        out_wait: dict[str, Any] = {
             "ok": False,
             "completed": False,
             "routed": "gemini",
@@ -3861,6 +4023,9 @@ class Bridge:
             "status": last_status.get("status", "wait_timeout"),
             "reason": "wait_timeout",
         }
+        if last_status.get("blockedReason"):
+            out_wait["blockedReason"] = last_status["blockedReason"]
+        return 1, out_wait
 
 
 def _validated_label(label: str | None = None, *, root: Path | None = None) -> tuple[str, Path]:
@@ -3950,9 +4115,12 @@ def cmd_doctor(bridge: Bridge, as_json: bool) -> int:
         stage = "screen"
     elif health.get("geminiRunning") is not True:
         stage = "gemini"
+    elif health.get("geminiResponsive") is False:
+        stage = "gemini"
     else:
         stage = "ok"
     ready = stage == "ok"
+    gemini_frozen = stage == "gemini" and health.get("geminiRunning") is True
 
     lang = error_catalog.detect_lang()
     tcc_py = resolve_launchagent_python()
@@ -3961,7 +4129,11 @@ def cmd_doctor(bridge: Bridge, as_json: bool) -> int:
             "daemon": "后台服务未运行或健康状态过期。运行 `gemini-task-bridge service install`（已安装则运行 `gemini-task-bridge service restart`）。",
             "daemon_accessibility": f"后台服务缺少辅助功能权限。打开「系统设置 → 隐私与安全性 → 辅助功能」，启用 `{tcc_py}` 后运行 `gemini-task-bridge service restart`。",
             "screen": "macOS 屏幕当前已锁定。解锁屏幕后运行 `gemini-task-bridge doctor` 复查。",
-            "gemini": "Gemini.app 未运行。运行 `open -a Gemini` 并保持主窗口打开。",
+            "gemini": (
+                "Gemini 界面卡住了（不响应）。强制退出后重新打开：`pkill -x Gemini; sleep 2; open -a Gemini`，排队的任务会自动继续。"
+                if gemini_frozen
+                else "Gemini.app 未运行。运行 `open -a Gemini` 并保持主窗口打开。"
+            ),
             "ok": "一切就绪。运行 `gemini-task-bridge pair list --json` 或通过 MCP 使用桥接。",
         }
     else:
@@ -3969,7 +4141,11 @@ def cmd_doctor(bridge: Bridge, as_json: bool) -> int:
             "daemon": "Daemon is not running or health is stale. Run `gemini-task-bridge service install` (or `gemini-task-bridge service restart`).",
             "daemon_accessibility": f"Daemon lacks Accessibility permission. Open System Settings -> Privacy & Security -> Accessibility, enable `{tcc_py}`, then run `gemini-task-bridge service restart`.",
             "screen": "macOS screen is locked. Unlock the screen and re-run `gemini-task-bridge doctor`.",
-            "gemini": "Gemini.app is not running. Run `open -a Gemini` and keep its main window open.",
+            "gemini": (
+                "Gemini's window is frozen (not responding). Force quit and reopen it: `pkill -x Gemini; sleep 2; open -a Gemini`. Queued tasks continue afterwards."
+                if gemini_frozen
+                else "Gemini.app is not running. Run `open -a Gemini` and keep its main window open."
+            ),
             "ok": "Ready. Run `gemini-task-bridge pair list --json` or use the bridge via MCP.",
         }
     next_step = next_map[stage]
@@ -4001,19 +4177,19 @@ def cmd_doctor(bridge: Bridge, as_json: bool) -> int:
 
         ax_ok = bool(daemon_ok and health.get("axTrusted") is True)
         screen_ok = bool(daemon_ok and health.get("screenLocked") is not True)
-        gem_ok = bool(daemon_ok and health.get("geminiRunning") is True)
+        gem_ok = bool(daemon_ok and health.get("geminiRunning") is True and health.get("geminiResponsive") is not False)
         print(f"gemini-task-bridge v{BRIDGE_VERSION} | ready={ready} | stage={stage}")
         if lang == "zh":
             print(f"{_mark(daemon_ok)} 后台服务（LaunchAgent + 健康心跳）")
             print(f"{_mark(ax_ok)} 后台辅助功能权限（axTrusted）")
             print(f"{_mark(screen_ok)} 屏幕未锁定")
-            print(f"{_mark(gem_ok)} Gemini.app 运行中")
+            print(f"{_mark(gem_ok)} Gemini.app 运行中且有响应")
             print(f"下一步：{next_step}")
         else:
             print(f"{_mark(daemon_ok)} Daemon (LaunchAgent + fresh health)")
             print(f"{_mark(ax_ok)} Daemon Accessibility (axTrusted)")
             print(f"{_mark(screen_ok)} Screen unlocked")
-            print(f"{_mark(gem_ok)} Gemini.app running")
+            print(f"{_mark(gem_ok)} Gemini.app running and responsive")
             print(f"Next: {next_step}")
     return 0
 
@@ -4271,6 +4447,7 @@ def cmd_send(bridge: Bridge, args: argparse.Namespace) -> int:
         reply_to=getattr(args, "reply_to", None),
         idempotency_key=getattr(args, "idempotency_key", None),
         forbid_legacy_pair_uid_deferral=False,
+        max_wait_seconds=(args.max_task_minutes * 60) if getattr(args, "max_task_minutes", None) is not None else None,
     )
     if res.get("routed") == "t3" and not res.get("idempotentReplay"):
         print(json.dumps(res, ensure_ascii=False, indent=2))
@@ -4533,6 +4710,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_send.add_argument("--wait", action="store_true")
     p_send.add_argument("--return-on-attention", action="store_true")
     p_send.add_argument("--timeout", type=float, default=300.0)
+    p_send.add_argument("--max-task-minutes", type=int, help="Give up on this task after N minutes (default: max_task_wait_seconds, 30 min)")
     p_send.add_argument("--json", action="store_true")
 
     p_task = sub.add_parser("task", help="Inspect, wait on, or read completed bridge tasks")

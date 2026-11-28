@@ -1,6 +1,6 @@
 {
   "name": "gemini-task-bridge",
-  "version": "2.2.1",
+  "version": "2.2.2",
   "description": "Zero-dependency 1-to-1 automated bridge, CLI task runner, and stdio MCP server connecting T3 Code, Claude Code, Codex, and Antigravity with Google Gemini Desktop Task conversations on macOS.",
   "author": {
     "name": "xsj0413abc-ui",
