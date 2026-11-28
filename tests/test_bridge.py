@@ -1931,7 +1931,7 @@ class BridgePhase1Tests(unittest.TestCase):
             "KeepAlive": True,
         }))
 
-        self.assertEqual(tb._script_bridge_version(installed_dst), (2, 2, 0))
+        self.assertEqual(tb._script_bridge_version(installed_dst), tb._parse_version_tuple(tb.BRIDGE_VERSION))
         with mock.patch.object(tb, "agent_info", return_value={"loaded": False}):
             ok_v21, reason_v21 = self.bridge.check_v21_runtime_for_root(self.bridge.config())
             self.assertTrue(ok_v21)
